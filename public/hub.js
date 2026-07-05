@@ -1,6 +1,6 @@
 'use strict';
 
-const VERSION = 'v8';
+const VERSION = 'v9';
 
 // Each game gets one entry here once it's built — `id` must match its folder name under
 // public/games/. `tagline` should name the one gesture the game uses (tap/swipe/hold), since
@@ -12,6 +12,7 @@ const GAMES = [
     { id: 'charge', name: 'Charge', tagline: 'Hold to charge', path: 'games/charge/', color: '#b565e8' },
     { id: 'orbit', name: 'Orbit', tagline: 'Spin to dodge', path: 'games/orbit/', color: '#2fd0c5' },
     { id: 'sling', name: 'Sling', tagline: 'Pull to launch', path: 'games/sling/', color: '#e83d9a' },
+    { id: 'tilt', name: 'Tilt', tagline: 'Tilt to steer', path: 'games/tilt/', color: '#5ddf7a' },
 ];
 
 function renderGameGrid() {
