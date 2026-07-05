@@ -1,4 +1,4 @@
-const CACHE = 'onehand-v5';
+const CACHE = 'onehand-v6';
 // HTML is not pre-cached — always fetched fresh from network
 const ASSETS = [
     'style.css', 'hub.js', 'manifest.json',
@@ -6,6 +6,7 @@ const ASSETS = [
     'games/dash/style.css', 'games/dash/dash.js',
     'games/charge/style.css', 'games/charge/charge.js',
     'games/orbit/style.css', 'games/orbit/orbit.js',
+    'games/sling/style.css', 'games/sling/sling.js',
 ];
 
 self.addEventListener('install', e => {
