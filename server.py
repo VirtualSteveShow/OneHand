@@ -14,12 +14,14 @@ async def static_handler(request):
     filepath = os.path.realpath(os.path.join(PUBLIC, filename))
     if not filepath.startswith(os.path.realpath(PUBLIC)):
         raise web.HTTPForbidden()
+    if os.path.isdir(filepath):
+        filepath = os.path.join(filepath, 'index.html')
     if not os.path.isfile(filepath):
         raise web.HTTPNotFound()
     response = web.FileResponse(filepath)
-    if filename == 'sw.js':
+    if filepath.endswith(os.sep + 'sw.js'):
         response.headers['Cache-Control'] = 'no-store'
-    elif filename.endswith(('.js', '.css', '.html')):
+    elif filepath.endswith(('.js', '.css', '.html')):
         response.headers['Cache-Control'] = 'no-cache'
     return response
 

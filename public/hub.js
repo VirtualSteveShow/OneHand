@@ -1,13 +1,13 @@
 'use strict';
 
-const VERSION = 'v1';
+const VERSION = 'v2';
 
 // Each game gets one entry here once it's built — `id` must match its folder name under
 // public/games/. `tagline` should name the one gesture the game uses (tap/swipe/hold), since
 // the whole point of this app is that every game is playable one-handed, thumb-only, with no
 // pinch/rotate/multi-touch and no controls that need a second hand to reach.
 const GAMES = [
-    // { id: 'example', name: 'Example', tagline: 'Tap to play', path: 'games/example/', color: '#e8a33d' },
+    { id: 'flap', name: 'Flap', tagline: 'Tap to flap', path: 'games/flap/', color: '#e8a33d' },
 ];
 
 function renderGameGrid() {

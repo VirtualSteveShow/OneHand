@@ -1,6 +1,9 @@
-const CACHE = 'onehand-v1';
+const CACHE = 'onehand-v2';
 // HTML is not pre-cached — always fetched fresh from network
-const ASSETS = ['style.css', 'hub.js', 'manifest.json'];
+const ASSETS = [
+    'style.css', 'hub.js', 'manifest.json',
+    'games/flap/style.css', 'games/flap/flap.js',
+];
 
 self.addEventListener('install', e => {
     e.waitUntil(
