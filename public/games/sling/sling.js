@@ -28,11 +28,16 @@ window.addEventListener('resize', resize);
 resize();
 
 const BALL_RADIUS = 14;
-const MAX_PULL = 130;          // px, pull distance for full power
+const MAX_PULL = 140;          // px, pull distance for full power
 const MIN_PULL = 16;           // px, below this a release is a no-op cancel
-const LAUNCH_MIN_SPEED = 260;  // px/s
-const LAUNCH_MAX_SPEED = 850;  // px/s
-const GRAVITY = 1300;          // px/s^2
+const LAUNCH_MIN_SPEED = 340;  // px/s
+const LAUNCH_MAX_SPEED = 1400; // px/s — must cover the worst case: anchor at
+                                // one bottom corner, target at the opposite
+                                // top corner. Reachable envelope (the "parabola
+                                // of safety") is Y_up <= v^2/2g - g*dx^2/2v^2;
+                                // the old 850/1300 pair left real targets
+                                // unreachable at max pull (see 2026-07-05 bug).
+const GRAVITY = 1000;          // px/s^2
 
 const TARGET_BASE_R = 46;
 const TARGET_MIN_R = 24;
