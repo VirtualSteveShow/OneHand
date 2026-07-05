@@ -39,6 +39,13 @@ html, body {
     letter-spacing: 0.5px;
 }
 
+#hub-version {
+    font-size: 11px;
+    color: #444;
+    margin-top: 4px;
+    letter-spacing: 0.5px;
+}
+
 #game-grid {
     width: 100%;
     max-width: 420px;

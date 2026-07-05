@@ -110,6 +110,8 @@ Same discipline as Snake, adapted for the hub shell (each individual game, once 
 | script tag | `public/index.html` `<script src="hub.js?v=N">` |
 | SW cache key | `public/sw.js` `const CACHE` |
 
+`VERSION` is also rendered on-screen (`#hub-version` in `index.html`, populated by `hub.js`) so the version is visible immediately on opening the app, without needing devtools or `curl` — added 2026-07-05 because it wasn't otherwise obvious whether a phone had picked up the latest deploy.
+
 **Note:** all asset paths in `index.html`, `manifest.json`, `sw.js`, and game files must stay **relative** (no leading `/`) — GitHub Pages serves this repo from `/OneHand/`, not domain root.
 
 ---
