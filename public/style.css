@@ -1,0 +1,84 @@
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #111111;
+    color: #eee;
+    font-family: monospace;
+    overflow: hidden;
+    overscroll-behavior: none;
+}
+
+#hub {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%; height: 100%;
+    padding: 24px 16px;
+    padding-top: max(24px, env(safe-area-inset-top));
+    padding-bottom: max(24px, env(safe-area-inset-bottom));
+}
+
+#hub-header {
+    text-align: center;
+    margin-bottom: 28px;
+}
+
+#hub-title {
+    font-size: 32px;
+    font-weight: bold;
+    letter-spacing: 3px;
+    color: #e8a33d;
+}
+
+#hub-tagline {
+    font-size: 12px;
+    color: #777;
+    margin-top: 6px;
+    letter-spacing: 0.5px;
+}
+
+#game-grid {
+    width: 100%;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+#empty-state {
+    text-align: center;
+    color: #555;
+    font-size: 13px;
+    padding: 40px 16px;
+    border: 1px dashed #2a2a2a;
+    border-radius: 12px;
+}
+
+.game-card {
+    display: block;
+    text-decoration: none;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-left: 4px solid var(--accent, #e8a33d);
+    border-radius: 10px;
+    padding: 16px 18px;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+}
+
+.game-card:active { background: #222; }
+
+.game-card-name {
+    color: #eee;
+    font-size: 16px;
+    font-weight: bold;
+    letter-spacing: 1px;
+}
+
+.game-card-tagline {
+    color: #888;
+    font-size: 12px;
+    margin-top: 4px;
+}
