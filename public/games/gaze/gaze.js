@@ -2,15 +2,22 @@
 
 // One-handed contract: this game's whole premise is different from the rest
 // of the hub — instead of a touch gesture, the input is the front camera
-// reading your face. Two modes share one camera/model session (loaded once,
-// switching modes doesn't reload it):
+// reading your face. Three modes share one camera/model session (loaded
+// once, switching modes doesn't reload it):
 //   - Blink: a blink is a binary trigger, exactly like Flap's tap — the
 //     physics/pipes are Flap's, unmodified, input source swapped.
 //   - Area: coarse look-direction (left/center/right) reused as Dash's 3
 //     lanes, but with only one obstacle type and never more than 2 lanes
 //     filled at once — there's no jump/duck fallback here, so a lane must
 //     always be free as an escape purely via where you're looking.
-// Full gaze-point tracking is planned as a third mode, not yet built.
+//   - Full: continuous gaze-point tracking. A 5-point look-and-tap
+//     calibration fits a small linear regression (hand-rolled least
+//     squares, no external calibration library) mapping the same
+//     look-direction signal Area uses (now on both axes) to actual screen
+//     coordinates. Targets need a sustained (cumulative, not strict) dwell
+//     to score — the most technically ambitious and least accurate mode of
+//     the three, by nature of estimating a 2D point from a phone camera
+//     without dedicated eye-tracking hardware.
 //
 // Video is processed entirely on-device via WASM (MediaPipe Tasks Vision);
 // nothing is ever recorded, stored, or sent anywhere. Starting/retrying a
@@ -61,6 +68,8 @@ let blinkSignal = 0;   // raw eyeBlinkLeft/Right average, 0..1
 let wasBlinking = false;
 let gazeXRaw = 0;       // raw look-direction signal, roughly -1 (left) .. 1 (right)
 let gazeXSmooth = 0;
+let gazeYRaw = 0;       // roughly -1 (up) .. 1 (down)
+let gazeYSmooth = 0;
 
 let lastTime;
 
@@ -401,13 +410,247 @@ function drawArea() {
     }
 }
 
+// --- Full mode (continuous gaze-point tracking, calibrated) -----------------
+
+const FULL_BEST_KEY = 'onehand-gaze-full-best';
+
+const CALIB_POINTS = [
+    { fx: 0.5, fy: 0.5 },
+    { fx: 0.15, fy: 0.18 },
+    { fx: 0.85, fy: 0.18 },
+    { fx: 0.15, fy: 0.82 },
+    { fx: 0.85, fy: 0.82 },
+];
+
+const FULL_TARGET_BASE_R = 70;
+const FULL_TARGET_MIN_R = 40;
+const FULL_TARGET_R_PER_SCORE = 2;
+
+const FULL_DWELL_REQUIRED_MS = 500;   // cumulative, not strict — looking away doesn't reset it
+const FULL_TIME_BUDGET_BASE_MS = 4500;
+const FULL_TIME_BUDGET_MIN_MS = 2500;
+const FULL_TIME_BUDGET_PER_SCORE = 80;
+
+let fullCalibrating = false;
+let fullCalibIndex = 0;
+let fullCalibSamples = [];
+let fullCalibration = null; // { calibX: [a,b,c], calibY: [a,b,c] } or null if never calibrated
+let fullTarget, fullDwellMs, fullTimeLeftMs;
+let fullPredX = 0, fullPredY = 0;
+
+// Solve a 3x3 linear system via Gaussian elimination with partial pivoting.
+function solve3x3(A, b) {
+    const M = A.map((row, i) => [...row, b[i]]);
+    for (let col = 0; col < 3; col++) {
+        let pivotRow = col;
+        for (let r = col + 1; r < 3; r++) {
+            if (Math.abs(M[r][col]) > Math.abs(M[pivotRow][col])) pivotRow = r;
+        }
+        [M[col], M[pivotRow]] = [M[pivotRow], M[col]];
+        const pivotVal = Math.abs(M[col][col]) > 1e-9 ? M[col][col] : 1e-9;
+        for (let c = col; c < 4; c++) M[col][c] /= pivotVal;
+        for (let r = 0; r < 3; r++) {
+            if (r === col) continue;
+            const factor = M[r][col];
+            for (let c = col; c < 4; c++) M[r][c] -= factor * M[col][c];
+        }
+    }
+    return [M[0][3], M[1][3], M[2][3]];
+}
+
+// Least-squares fit of screenAxis = a*gazeX + b*gazeY + c from the 5
+// calibration samples, via the normal equations (A^T A x = A^T y).
+function fitAxis(samples, outKey) {
+    const ATA = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const ATy = [0, 0, 0];
+    for (const s of samples) {
+        const row = [s.gazeX, s.gazeY, 1];
+        for (let i = 0; i < 3; i++) {
+            ATy[i] += row[i] * s[outKey];
+            for (let j = 0; j < 3; j++) ATA[i][j] += row[i] * row[j];
+        }
+    }
+    return solve3x3(ATA, ATy);
+}
+
+function computeCalibration(samples) {
+    return { calibX: fitAxis(samples, 'screenX'), calibY: fitAxis(samples, 'screenY') };
+}
+
+function applyCalibration() {
+    if (!fullCalibration) { fullPredX = W / 2; fullPredY = H / 2; return; }
+    const { calibX, calibY } = fullCalibration;
+    const px = calibX[0] * gazeXSmooth + calibX[1] * gazeYSmooth + calibX[2];
+    const py = calibY[0] * gazeXSmooth + calibY[1] * gazeYSmooth + calibY[2];
+    fullPredX = Math.max(0, Math.min(W, px));
+    fullPredY = Math.max(0, Math.min(H, py));
+}
+
+function startFullCalibration() {
+    fullCalibrating = true;
+    fullCalibIndex = 0;
+    fullCalibSamples = [];
+}
+
+function captureCalibSample() {
+    const pt = CALIB_POINTS[fullCalibIndex];
+    fullCalibSamples.push({
+        gazeX: gazeXSmooth, gazeY: gazeYSmooth,
+        screenX: pt.fx * W, screenY: pt.fy * H,
+    });
+    fullCalibIndex++;
+    if (fullCalibIndex >= CALIB_POINTS.length) {
+        fullCalibration = computeCalibration(fullCalibSamples);
+        fullCalibrating = false;
+        resetFullRun();
+    }
+}
+
+function fullTargetRadius(currentScore) {
+    return Math.max(FULL_TARGET_MIN_R, FULL_TARGET_BASE_R - currentScore * FULL_TARGET_R_PER_SCORE);
+}
+function fullTimeBudget(currentScore) {
+    return Math.max(FULL_TIME_BUDGET_MIN_MS, FULL_TIME_BUDGET_BASE_MS - currentScore * FULL_TIME_BUDGET_PER_SCORE);
+}
+
+function fullNextTarget() {
+    const r = fullTargetRadius(score);
+    const margin = r + 20;
+    fullTarget = {
+        x: margin + Math.random() * (W - margin * 2),
+        y: margin + Math.random() * (H - margin * 2),
+        r,
+    };
+    fullDwellMs = 0;
+    fullTimeLeftMs = fullTimeBudget(score);
+}
+
+function resetFullRun() {
+    score = 0;
+    best = loadBestFor(FULL_BEST_KEY);
+    fullNextTarget();
+    modeState = MODE_STATE.START;
+}
+
+function fullGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(FULL_BEST_KEY, best);
+}
+
+function updateFull(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
+
+    const dist = Math.hypot(fullPredX - fullTarget.x, fullPredY - fullTarget.y);
+    if (dist < fullTarget.r) fullDwellMs += dt * 1000;
+    fullTimeLeftMs -= dt * 1000;
+
+    if (fullDwellMs >= FULL_DWELL_REQUIRED_MS) {
+        score++;
+        fullNextTarget();
+    } else if (fullTimeLeftMs <= 0) {
+        fullGameOver();
+    }
+}
+
+function drawCalibration() {
+    const pt = CALIB_POINTS[fullCalibIndex];
+    const tx = pt.fx * W, ty = pt.fy * H;
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(tx, ty, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(tx, ty, 24, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText('LOOK HERE, THEN TAP', W / 2, H * 0.9);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText((fullCalibIndex + 1) + ' / ' + CALIB_POINTS.length, W / 2, H * 0.9 + 24);
+}
+
+function drawFull() {
+    if (fullCalibration) {
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(fullPredX - 10, fullPredY);
+        ctx.lineTo(fullPredX + 10, fullPredY);
+        ctx.moveTo(fullPredX, fullPredY - 10);
+        ctx.lineTo(fullPredX, fullPredY + 10);
+        ctx.stroke();
+    }
+
+    if (modeState === MODE_STATE.PLAYING && fullTarget) {
+        ctx.fillStyle = 'rgba(232, 216, 61, 0.18)';
+        ctx.strokeStyle = '#e8d83d';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(fullTarget.x, fullTarget.y, fullTarget.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        const frac = Math.min(1, fullDwellMs / FULL_DWELL_REQUIRED_MS);
+        if (frac > 0) {
+            ctx.strokeStyle = '#4ec97a';
+            ctx.lineWidth = 5;
+            ctx.beginPath();
+            ctx.arc(fullTarget.x, fullTarget.y, fullTarget.r + 10, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+            ctx.stroke();
+        }
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('LOOK & DWELL', W / 2, H * 0.3);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('TAP TO START', W / 2, H * 0.3 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.3 + 50);
+        drawRecalibrateHint();
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.3);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.3 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.3 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.3 + 122);
+    }
+}
+
 // --- mode select --------------------------------------------------------
 
 function modeButtonRect(index) {
-    return { cx: W / 2, cy: H * 0.42 + index * 90, w: 240, h: 64 };
+    return { cx: W / 2, cy: H * 0.32 + index * 90, w: 240, h: 64 };
 }
 function changeModeHintRect() {
     return { cx: W / 2, cy: H * 0.8, w: 220, h: 40 };
+}
+function recalibrateHintRect() {
+    return { cx: W / 2, cy: H * 0.72, w: 220, h: 36 };
 }
 function pointInRect(x, y, r) {
     return Math.abs(x - r.cx) < r.w / 2 && Math.abs(y - r.cy) < r.h / 2;
@@ -420,19 +663,34 @@ function drawChangeModeHint() {
     ctx.fillText('CHANGE MODE', r.cx, r.cy + 4);
 }
 
+function drawRecalibrateHint() {
+    const r = recalibrateHintRect();
+    ctx.fillStyle = '#666666';
+    ctx.font = '12px monospace';
+    ctx.fillText('RECALIBRATE', r.cx, r.cy + 4);
+}
+
 function enterMode(m) {
     mode = m;
     state = STATE.IN_GAME;
     if (m === 'blink') resetBlinkRun();
     else if (m === 'area') resetAreaRun();
+    else if (m === 'full') {
+        if (fullCalibration) resetFullRun();
+        else startFullCalibration();
+    }
 }
 
 function drawModeSelect() {
     ctx.fillStyle = '#eeeeee';
     ctx.font = 'bold 20px monospace';
-    ctx.fillText('CHOOSE A MODE', W / 2, H * 0.28);
+    ctx.fillText('CHOOSE A MODE', W / 2, H * 0.2);
 
-    const labels = [['BLINK', 'Blink to flap'], ['AREA', 'Look left/center/right']];
+    const labels = [
+        ['BLINK', 'Blink to flap'],
+        ['AREA', 'Look left/center/right'],
+        ['FULL', 'Look & dwell (calibrated)'],
+    ];
     labels.forEach(([name, sub], i) => {
         const r = modeButtonRect(i);
         roundRect(r.cx - r.w / 2, r.cy - r.h / 2, r.w, r.h, 12);
@@ -511,9 +769,14 @@ function detectLoop() {
             const lookRight = (blendshapeScore(cats, 'eyeLookInLeft') + blendshapeScore(cats, 'eyeLookOutRight')) / 2;
             const lookLeft = (blendshapeScore(cats, 'eyeLookOutLeft') + blendshapeScore(cats, 'eyeLookInRight')) / 2;
             gazeXRaw = lookRight - lookLeft;
+
+            const lookDown = (blendshapeScore(cats, 'eyeLookDownLeft') + blendshapeScore(cats, 'eyeLookDownRight')) / 2;
+            const lookUp = (blendshapeScore(cats, 'eyeLookUpLeft') + blendshapeScore(cats, 'eyeLookUpRight')) / 2;
+            gazeYRaw = lookDown - lookUp;
         } else {
             blinkSignal = 0;
             gazeXRaw = 0;
+            gazeYRaw = 0;
         }
 
         const isBlinking = blinkSignal > BLINK_THRESHOLD;
@@ -533,10 +796,13 @@ window.addEventListener('pagehide', () => {
 
 function update(dt) {
     gazeXSmooth += (gazeXRaw - gazeXSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
+    gazeYSmooth += (gazeYRaw - gazeYSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
+    if (mode === 'full' && fullCalibration) applyCalibration();
 
     if (state !== STATE.IN_GAME) return;
     if (mode === 'blink') updateBlink(dt);
     else if (mode === 'area') updateArea(dt);
+    else if (mode === 'full') updateFull(dt);
 }
 
 function draw() {
@@ -578,6 +844,10 @@ function draw() {
     } else if (state === STATE.IN_GAME) {
         if (mode === 'blink') drawBlink();
         else if (mode === 'area') drawArea();
+        else if (mode === 'full') {
+            if (fullCalibrating) drawCalibration();
+            else drawFull();
+        }
     }
 
     // small live camera preview so the player can confirm they're in frame
@@ -618,12 +888,21 @@ canvas.addEventListener('pointerdown', e => {
     if (state === STATE.MODE_SELECT) {
         if (pointInRect(x, y, modeButtonRect(0))) enterMode('blink');
         else if (pointInRect(x, y, modeButtonRect(1))) enterMode('area');
+        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('full');
         return;
     }
 
     if (state === STATE.IN_GAME) {
+        if (mode === 'full' && fullCalibrating) {
+            captureCalibSample();
+            return;
+        }
         if (modeState === MODE_STATE.START && pointInRect(x, y, changeModeHintRect())) {
             state = STATE.MODE_SELECT;
+            return;
+        }
+        if (mode === 'full' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
+            startFullCalibration();
             return;
         }
         if (mode === 'blink') {
@@ -632,6 +911,9 @@ canvas.addEventListener('pointerdown', e => {
         } else if (mode === 'area') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetAreaRun();
+        } else if (mode === 'full') {
+            if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
+            else if (modeState === MODE_STATE.OVER) resetFullRun();
         }
     }
 });
