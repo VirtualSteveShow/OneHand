@@ -2,14 +2,21 @@
 
 // One-handed contract: this game's whole premise is different from the rest
 // of the hub — instead of a touch gesture, the input is the front camera
-// reading your face. Blink mode (the only mode built so far; Area and Full
-// gaze-point modes are planned as additions to this same game) treats a
-// blink as a binary trigger, exactly like Flap's tap — the physics/pipes
-// below are Flap's, unmodified, with the input source swapped. Video is
-// processed entirely on-device via WASM (MediaPipe Tasks Vision); nothing
-// is ever recorded, stored, or sent anywhere. START/RETRY still happen via
-// a tap (matching Tilt's precedent — device sensors still need one initial
-// touch to begin a run), and blink only drives the actual flap action.
+// reading your face. Two modes share one camera/model session (loaded once,
+// switching modes doesn't reload it):
+//   - Blink: a blink is a binary trigger, exactly like Flap's tap — the
+//     physics/pipes are Flap's, unmodified, input source swapped.
+//   - Area: coarse look-direction (left/center/right) reused as Dash's 3
+//     lanes, but with only one obstacle type and never more than 2 lanes
+//     filled at once — there's no jump/duck fallback here, so a lane must
+//     always be free as an escape purely via where you're looking.
+// Full gaze-point tracking is planned as a third mode, not yet built.
+//
+// Video is processed entirely on-device via WASM (MediaPipe Tasks Vision);
+// nothing is ever recorded, stored, or sent anywhere. Starting/retrying a
+// run still happens via a tap (matching Tilt's precedent — device sensors
+// still need one initial touch to begin a run); the actual gameplay action
+// (blink, or look direction) needs zero further touch.
 //
 // This is the first game in the hub to load an external library rather
 // than being fully self-contained vanilla JS — unavoidable for real face
@@ -38,6 +45,43 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+// App-level state: getting the camera/model ready, picking a mode, or
+// actively inside a mode's own start/playing/over cycle.
+const STATE = { PERMISSION: 'permission', LOADING: 'loading', ERROR: 'error', MODE_SELECT: 'modeSelect', IN_GAME: 'inGame' };
+let state = STATE.PERMISSION;
+let errorReason = '';
+
+let mode = null; // 'blink' | 'area'
+const MODE_STATE = { START: 'start', PLAYING: 'playing', OVER: 'over' };
+let modeState = MODE_STATE.START;
+
+let faceLandmarker = null;
+let cameraStream = null;
+let blinkSignal = 0;   // raw eyeBlinkLeft/Right average, 0..1
+let wasBlinking = false;
+let gazeXRaw = 0;       // raw look-direction signal, roughly -1 (left) .. 1 (right)
+let gazeXSmooth = 0;
+
+let lastTime;
+
+function loadBestFor(key) { return parseInt(localStorage.getItem(key) || '0', 10); }
+function saveBestFor(key, v) { localStorage.setItem(key, String(v)); }
+
+function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+}
+
+// --- Blink mode (Flap's physics, blink-triggered) ---------------------------
+
+const BLINK_BEST_KEY = 'onehand-gaze-blink-best';
+const BLINK_THRESHOLD = 0.55;
+
 const GRAVITY = 1600;
 const FLAP_VELOCITY = -460;
 const PIPE_SPEED = 190;
@@ -47,50 +91,29 @@ const PIPE_INTERVAL = 1500;
 const BIRD_RADIUS = 18;
 const BIRD_X_RATIO = 0.32;
 
-const BLINK_THRESHOLD = 0.55;
+let bird, pipes, blinkSpawnTimerMs;
+let score = 0, best = 0; // shared across whichever mode is active
 
-const BEST_KEY = 'onehand-gaze-best';
-
-// PERMISSION: waiting for the user to tap "enable camera". LOADING: camera
-// granted, fetching the model. ERROR: camera denied or model failed to
-// load. START/PLAYING/OVER: same meaning as every other game.
-const STATE = { PERMISSION: 'permission', LOADING: 'loading', ERROR: 'error', START: 'start', PLAYING: 'playing', OVER: 'over' };
-let state = STATE.PERMISSION;
-let errorReason = '';
-
-let bird, pipes, score, best, spawnTimerMs, lastTime;
-
-let faceLandmarker = null;
-let cameraStream = null;
-let blinkScore = 0;
-let wasBlinking = false;
-
-function loadBest() { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10); }
-function saveBest(v) { localStorage.setItem(BEST_KEY, String(v)); }
-
-function resetRun() {
+function resetBlinkRun() {
     bird = { y: H / 2, vy: 0, rot: 0 };
     pipes = [];
     score = 0;
-    spawnTimerMs = 0;
+    blinkSpawnTimerMs = 0;
+    best = loadBestFor(BLINK_BEST_KEY);
+    modeState = MODE_STATE.START;
 }
 
-function reset() {
-    resetRun();
-    state = STATE.START;
-}
-
-function gameOver() {
-    state = STATE.OVER;
+function blinkGameOver() {
+    modeState = MODE_STATE.OVER;
     best = Math.max(best, score);
-    saveBest(best);
+    saveBestFor(BLINK_BEST_KEY, best);
 }
 
-function flap() {
-    if (state === STATE.START) {
-        state = STATE.PLAYING;
+function blinkTrigger() {
+    if (modeState === MODE_STATE.START) {
+        modeState = MODE_STATE.PLAYING;
         bird.vy = FLAP_VELOCITY;
-    } else if (state === STATE.PLAYING) {
+    } else if (modeState === MODE_STATE.PLAYING) {
         bird.vy = FLAP_VELOCITY;
     }
 }
@@ -103,16 +126,16 @@ function spawnPipe() {
     pipes.push({ x: W + PIPE_WIDTH, top, scored: false });
 }
 
-function update(dt) {
-    if (state !== STATE.PLAYING) return;
+function updateBlink(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
 
     bird.vy += GRAVITY * dt;
     bird.y += bird.vy * dt;
     bird.rot = Math.max(-0.5, Math.min(1.2, bird.vy / 500));
 
-    spawnTimerMs += dt * 1000;
-    if (spawnTimerMs >= PIPE_INTERVAL) {
-        spawnTimerMs = 0;
+    blinkSpawnTimerMs += dt * 1000;
+    if (blinkSpawnTimerMs >= PIPE_INTERVAL) {
+        blinkSpawnTimerMs = 0;
         spawnPipe();
     }
 
@@ -131,17 +154,300 @@ function update(dt) {
         if (bird.vy < 0) bird.vy = 0;
     }
     if (bird.y + BIRD_RADIUS > H) {
-        gameOver();
+        blinkGameOver();
         return;
     }
     for (const p of pipes) {
         if (birdX + BIRD_RADIUS > p.x && birdX - BIRD_RADIUS < p.x + PIPE_WIDTH) {
             if (bird.y - BIRD_RADIUS < p.top || bird.y + BIRD_RADIUS > p.top + PIPE_GAP) {
-                gameOver();
+                blinkGameOver();
                 return;
             }
         }
     }
+}
+
+function drawBlink() {
+    ctx.fillStyle = '#2f7a4d';
+    for (const p of pipes) {
+        ctx.fillRect(p.x, 0, PIPE_WIDTH, p.top);
+        ctx.fillRect(p.x, p.top + PIPE_GAP, PIPE_WIDTH, H - (p.top + PIPE_GAP));
+    }
+
+    const birdX = W * BIRD_X_RATIO;
+    ctx.save();
+    ctx.translate(birdX, bird.y);
+    ctx.rotate(bird.rot);
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(0, 0, BIRD_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#111111';
+    ctx.beginPath();
+    ctx.arc(BIRD_RADIUS * 0.4, -BIRD_RADIUS * 0.3, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('BLINK TO FLAP', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('LOOK AT THE SCREEN AND BLINK', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.32);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.32 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.32 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.32 + 122);
+    }
+}
+
+// --- Area mode (coarse look-direction, Dash's lane logic) --------------------
+
+const AREA_BEST_KEY = 'onehand-gaze-area-best';
+const LANE_COUNT = 3;
+const LANE_LERP_RATE = 12;
+
+const GAZE_SMOOTH_RATE = 10;  // per second
+const GAZE_THRESHOLD = 0.10;  // classify left/right beyond this smoothed value
+
+const AREA_OBSTACLE_HEIGHT = 50;
+const AREA_SPEED_BASE = 220;
+const AREA_SPEED_MAX = 420;
+const AREA_SPEED_PER_SCORE = 8;
+
+const AREA_SPAWN_BASE_MS = 1200;
+const AREA_SPAWN_MIN_MS = 700;
+const AREA_SPAWN_PER_SCORE = 15;
+const AREA_SPAWN_JITTER_MS = 150;
+
+let areaPlayer, areaObstacles, areaSpawnTimerMs, areaSpawnIntervalMs, areaSpeed;
+let areaRowRemaining, areaNextRowId;
+
+function areaLaneCenterX(lane) {
+    const laneWidth = W / LANE_COUNT;
+    return laneWidth * (lane + 0.5);
+}
+function areaBaselineY() { return H * 0.78; }
+
+function resetAreaRun() {
+    areaPlayer = { lane: 1, targetLane: 1 };
+    areaObstacles = [];
+    score = 0;
+    areaSpawnTimerMs = 0;
+    areaSpawnIntervalMs = AREA_SPAWN_BASE_MS;
+    areaSpeed = AREA_SPEED_BASE;
+    areaRowRemaining = new Map();
+    areaNextRowId = 0;
+    best = loadBestFor(AREA_BEST_KEY);
+    modeState = MODE_STATE.START;
+}
+
+function areaGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(AREA_BEST_KEY, best);
+}
+
+function classifyGazeLane(smoothed) {
+    if (smoothed < -GAZE_THRESHOLD) return 0;
+    if (smoothed > GAZE_THRESHOLD) return 2;
+    return 1;
+}
+
+function areaP2(currentScore) {
+    return Math.min(0.6, 0.15 + currentScore * 0.03);
+}
+
+function areaShuffledLanes() {
+    const lanes = [0, 1, 2];
+    for (let i = lanes.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [lanes[i], lanes[j]] = [lanes[j], lanes[i]];
+    }
+    return lanes;
+}
+
+function areaSpawnRow() {
+    // Never fills all 3 lanes — there's no jump/duck fallback in this mode,
+    // so a lane must always be free as an escape purely from where you look.
+    const count = Math.random() < areaP2(score) ? 2 : 1;
+    const lanes = areaShuffledLanes().slice(0, count);
+    const rowId = areaNextRowId++;
+    areaRowRemaining.set(rowId, lanes.length);
+    for (const lane of lanes) {
+        areaObstacles.push({ lane, y: -AREA_OBSTACLE_HEIGHT, scored: false, rowId });
+    }
+}
+
+function updateArea(dt) {
+    if (modeState === MODE_STATE.PLAYING) {
+        areaPlayer.targetLane = classifyGazeLane(gazeXSmooth);
+        areaPlayer.lane += (areaPlayer.targetLane - areaPlayer.lane) * Math.min(1, dt * LANE_LERP_RATE);
+
+        areaSpawnTimerMs += dt * 1000;
+        if (areaSpawnTimerMs >= areaSpawnIntervalMs) {
+            areaSpawnTimerMs = 0;
+            areaSpawnIntervalMs = Math.max(AREA_SPAWN_MIN_MS, AREA_SPAWN_BASE_MS - score * AREA_SPAWN_PER_SCORE)
+                + (Math.random() * AREA_SPAWN_JITTER_MS * 2 - AREA_SPAWN_JITTER_MS);
+            areaSpawnRow();
+        }
+
+        const hitY = areaBaselineY();
+        for (const o of areaObstacles) {
+            o.y += areaSpeed * dt;
+
+            const spans = o.y <= hitY && hitY <= o.y + AREA_OBSTACLE_HEIGHT;
+            const sameLane = Math.abs(areaPlayer.lane - o.lane) < 0.5;
+            if (spans && sameLane) {
+                areaGameOver();
+                return;
+            }
+
+            if (!o.scored && o.y > hitY) {
+                o.scored = true;
+                const remaining = (areaRowRemaining.get(o.rowId) || 1) - 1;
+                if (remaining <= 0) {
+                    areaRowRemaining.delete(o.rowId);
+                    score++;
+                    areaSpeed = Math.min(AREA_SPEED_MAX, AREA_SPEED_BASE + score * AREA_SPEED_PER_SCORE);
+                } else {
+                    areaRowRemaining.set(o.rowId, remaining);
+                }
+            }
+        }
+        areaObstacles = areaObstacles.filter(o => o.y < H + 40);
+    }
+}
+
+function drawArea() {
+    const laneWidth = W / LANE_COUNT;
+    ctx.strokeStyle = '#242424';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < LANE_COUNT; i++) {
+        ctx.beginPath();
+        ctx.moveTo(laneWidth * i, 0);
+        ctx.lineTo(laneWidth * i, H);
+        ctx.stroke();
+    }
+
+    for (const o of areaObstacles) {
+        const w = laneWidth * 0.7;
+        const x = areaLaneCenterX(o.lane) - w / 2;
+        roundRect(x, o.y, w, AREA_OBSTACLE_HEIGHT, 8);
+        ctx.fillStyle = '#e8763d';
+        ctx.fill();
+    }
+
+    const px = areaLaneCenterX(areaPlayer ? areaPlayer.lane : 1);
+    const py = areaBaselineY();
+    ctx.fillStyle = '#e8d83d';
+    roundRect(px - 23, py - 23, 46, 46, 12);
+    ctx.fill();
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('LOOK TO STEER', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('TAP TO START, THEN LOOK L/C/R', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.3);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.3 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.3 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.3 + 122);
+    }
+}
+
+// --- mode select --------------------------------------------------------
+
+function modeButtonRect(index) {
+    return { cx: W / 2, cy: H * 0.42 + index * 90, w: 240, h: 64 };
+}
+function changeModeHintRect() {
+    return { cx: W / 2, cy: H * 0.8, w: 220, h: 40 };
+}
+function pointInRect(x, y, r) {
+    return Math.abs(x - r.cx) < r.w / 2 && Math.abs(y - r.cy) < r.h / 2;
+}
+
+function drawChangeModeHint() {
+    const r = changeModeHintRect();
+    ctx.fillStyle = '#666666';
+    ctx.font = '12px monospace';
+    ctx.fillText('CHANGE MODE', r.cx, r.cy + 4);
+}
+
+function enterMode(m) {
+    mode = m;
+    state = STATE.IN_GAME;
+    if (m === 'blink') resetBlinkRun();
+    else if (m === 'area') resetAreaRun();
+}
+
+function drawModeSelect() {
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('CHOOSE A MODE', W / 2, H * 0.28);
+
+    const labels = [['BLINK', 'Blink to flap'], ['AREA', 'Look left/center/right']];
+    labels.forEach(([name, sub], i) => {
+        const r = modeButtonRect(i);
+        roundRect(r.cx - r.w / 2, r.cy - r.h / 2, r.w, r.h, 12);
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fill();
+        ctx.strokeStyle = '#e8d83d';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 18px monospace';
+        ctx.fillText(name, r.cx, r.cy - 4);
+        ctx.fillStyle = '#888888';
+        ctx.font = '12px monospace';
+        ctx.fillText(sub, r.cx, r.cy + 18);
+    });
 }
 
 // --- camera + face tracking setup -----------------------------------------
@@ -184,8 +490,13 @@ async function startCameraFlow() {
     if (!camOk) { state = STATE.ERROR; return; }
     const modelOk = await loadFaceLandmarker();
     if (!modelOk) { state = STATE.ERROR; return; }
-    reset();
+    state = STATE.MODE_SELECT;
     detectLoop();
+}
+
+function blendshapeScore(cats, name) {
+    const c = cats.find(c => c.categoryName === name);
+    return c ? c.score : 0;
 }
 
 function detectLoop() {
@@ -193,15 +504,22 @@ function detectLoop() {
         const result = faceLandmarker.detectForVideo(videoEl, performance.now());
         if (result.faceBlendshapes && result.faceBlendshapes.length > 0) {
             const cats = result.faceBlendshapes[0].categories;
-            const l = cats.find(c => c.categoryName === 'eyeBlinkLeft');
-            const r = cats.find(c => c.categoryName === 'eyeBlinkRight');
-            blinkScore = ((l ? l.score : 0) + (r ? r.score : 0)) / 2;
+            const l = blendshapeScore(cats, 'eyeBlinkLeft');
+            const r = blendshapeScore(cats, 'eyeBlinkRight');
+            blinkSignal = (l + r) / 2;
+
+            const lookRight = (blendshapeScore(cats, 'eyeLookInLeft') + blendshapeScore(cats, 'eyeLookOutRight')) / 2;
+            const lookLeft = (blendshapeScore(cats, 'eyeLookOutLeft') + blendshapeScore(cats, 'eyeLookInRight')) / 2;
+            gazeXRaw = lookRight - lookLeft;
         } else {
-            blinkScore = 0;
+            blinkSignal = 0;
+            gazeXRaw = 0;
         }
 
-        const isBlinking = blinkScore > BLINK_THRESHOLD;
-        if (isBlinking && !wasBlinking) flap();
+        const isBlinking = blinkSignal > BLINK_THRESHOLD;
+        if (mode === 'blink' && state === STATE.IN_GAME && isBlinking && !wasBlinking) {
+            blinkTrigger();
+        }
         wasBlinking = isBlinking;
     }
     requestAnimationFrame(detectLoop);
@@ -211,13 +529,20 @@ window.addEventListener('pagehide', () => {
     if (cameraStream) cameraStream.getTracks().forEach(t => t.stop());
 });
 
-// --- rendering --------------------------------------------------------------
+// --- top-level update/draw/input --------------------------------------------
+
+function update(dt) {
+    gazeXSmooth += (gazeXRaw - gazeXSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
+
+    if (state !== STATE.IN_GAME) return;
+    if (mode === 'blink') updateBlink(dt);
+    else if (mode === 'area') updateArea(dt);
+}
 
 function draw() {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = '#111111';
     ctx.fillRect(0, 0, W, H);
-
     ctx.textAlign = 'center';
 
     if (state === STATE.PERMISSION) {
@@ -248,57 +573,11 @@ function draw() {
         return;
     }
 
-    ctx.fillStyle = '#2f7a4d';
-    for (const p of pipes) {
-        ctx.fillRect(p.x, 0, PIPE_WIDTH, p.top);
-        ctx.fillRect(p.x, p.top + PIPE_GAP, PIPE_WIDTH, H - (p.top + PIPE_GAP));
-    }
-
-    const birdX = W * BIRD_X_RATIO;
-    ctx.save();
-    ctx.translate(birdX, bird.y);
-    ctx.rotate(bird.rot);
-    ctx.fillStyle = '#e8d83d';
-    ctx.beginPath();
-    ctx.arc(0, 0, BIRD_RADIUS, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#111111';
-    ctx.beginPath();
-    ctx.arc(BIRD_RADIUS * 0.4, -BIRD_RADIUS * 0.3, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-
-    if (state === STATE.PLAYING) {
-        ctx.fillStyle = '#eeeeee';
-        ctx.font = 'bold 42px monospace';
-        ctx.fillText(String(score), W / 2, 80);
-    }
-
-    if (state === STATE.START) {
-        ctx.fillStyle = '#eeeeee';
-        ctx.font = 'bold 22px monospace';
-        ctx.fillText('BLINK TO FLAP', W / 2, H * 0.4);
-        ctx.fillStyle = '#888888';
-        ctx.font = '13px monospace';
-        ctx.fillText('LOOK AT THE SCREEN AND BLINK', W / 2, H * 0.4 + 30);
-        if (best > 0) {
-            ctx.fillText('BEST ' + best, W / 2, H * 0.4 + 52);
-        }
-    }
-
-    if (state === STATE.OVER) {
-        ctx.fillStyle = '#eeeeee';
-        ctx.font = 'bold 26px monospace';
-        ctx.fillText('GAME OVER', W / 2, H * 0.35);
-        ctx.fillStyle = '#e8d83d';
-        ctx.font = 'bold 42px monospace';
-        ctx.fillText(String(score), W / 2, H * 0.35 + 58);
-        ctx.fillStyle = '#888888';
-        ctx.font = '13px monospace';
-        ctx.fillText('BEST ' + best, W / 2, H * 0.35 + 84);
-        ctx.fillStyle = '#eeeeee';
-        ctx.font = '14px monospace';
-        ctx.fillText('TAP TO RETRY', W / 2, H * 0.35 + 122);
+    if (state === STATE.MODE_SELECT) {
+        drawModeSelect();
+    } else if (state === STATE.IN_GAME) {
+        if (mode === 'blink') drawBlink();
+        else if (mode === 'area') drawArea();
     }
 
     // small live camera preview so the player can confirm they're in frame
@@ -325,15 +604,34 @@ function loop(time) {
     requestAnimationFrame(loop);
 }
 
-best = loadBest();
-resetRun();
 requestAnimationFrame(loop);
 
 canvas.addEventListener('pointerdown', e => {
     e.preventDefault();
+    const x = e.clientX, y = e.clientY;
+
     if (state === STATE.PERMISSION || state === STATE.ERROR) {
         startCameraFlow();
-    } else if (state === STATE.OVER) {
-        reset();
+        return;
+    }
+
+    if (state === STATE.MODE_SELECT) {
+        if (pointInRect(x, y, modeButtonRect(0))) enterMode('blink');
+        else if (pointInRect(x, y, modeButtonRect(1))) enterMode('area');
+        return;
+    }
+
+    if (state === STATE.IN_GAME) {
+        if (modeState === MODE_STATE.START && pointInRect(x, y, changeModeHintRect())) {
+            state = STATE.MODE_SELECT;
+            return;
+        }
+        if (mode === 'blink') {
+            if (modeState === MODE_STATE.OVER) resetBlinkRun();
+            // modeState START -> PLAYING happens via blink itself, not tap
+        } else if (mode === 'area') {
+            if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
+            else if (modeState === MODE_STATE.OVER) resetAreaRun();
+        }
     }
 });
