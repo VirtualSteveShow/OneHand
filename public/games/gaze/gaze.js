@@ -839,10 +839,196 @@ function drawFull() {
     }
 }
 
+// --- Split mode (left/right only, no center zone) ---------------------------
+//
+// User feedback on Area: juggling 3 zones (left/center/right) felt less
+// certain than a clean binary choice. Split removes the center zone
+// entirely — classification is a pure sign test relative to a single
+// calibrated center point, no sensitivity fraction to tune at all, since
+// there's no longer a "how close to the extreme" question. Calibration is
+// a single "look center" step instead of Area's three.
+
+const SPLIT_BEST_KEY = 'onehand-gaze-split-best';
+const SPLIT_LANE_COUNT = 2;
+
+const SPLIT_OBSTACLE_HEIGHT = 50;
+const SPLIT_SPEED_BASE = 220;
+const SPLIT_SPEED_MAX = 420;
+const SPLIT_SPEED_PER_SCORE = 8;
+
+const SPLIT_SPAWN_BASE_MS = 1100;
+const SPLIT_SPAWN_MIN_MS = 650;
+const SPLIT_SPAWN_PER_SCORE = 15;
+const SPLIT_SPAWN_JITTER_MS = 150;
+
+let splitPlayer, splitObstacles, splitSpawnTimerMs, splitSpawnIntervalMs, splitSpeed;
+let splitCalibrating = false;
+let splitCenter = null; // calibrated gazeXSmooth value representing "straight ahead", or null if never calibrated
+
+function splitLaneCenterX(lane) {
+    const laneWidth = W / SPLIT_LANE_COUNT;
+    return laneWidth * (lane + 0.5);
+}
+function splitBaselineY() { return H * 0.78; }
+
+function classifySplitLane(smoothed) {
+    if (splitCenter === null) return smoothed < 0 ? 0 : 1; // shouldn't normally happen — calibration is required first
+    return smoothed < splitCenter ? 0 : 1;
+}
+
+function startSplitCalibration() {
+    splitCalibrating = true;
+}
+
+function captureSplitCalibSample() {
+    splitCenter = gazeXSmooth;
+    splitCalibrating = false;
+    resetSplitRun();
+}
+
+function resetSplitRun() {
+    const initialLane = classifySplitLane(gazeXSmooth);
+    splitPlayer = { lane: initialLane, targetLane: initialLane };
+    splitObstacles = [];
+    score = 0;
+    splitSpawnTimerMs = 0;
+    splitSpawnIntervalMs = SPLIT_SPAWN_BASE_MS;
+    splitSpeed = SPLIT_SPEED_BASE;
+    best = loadBestFor(SPLIT_BEST_KEY);
+    modeState = MODE_STATE.START;
+}
+
+function splitGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(SPLIT_BEST_KEY, best);
+}
+
+function spawnSplitObstacle() {
+    const lane = Math.floor(Math.random() * SPLIT_LANE_COUNT);
+    splitObstacles.push({ lane, y: -SPLIT_OBSTACLE_HEIGHT, scored: false });
+}
+
+function updateSplit(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
+
+    splitPlayer.targetLane = classifySplitLane(gazeXSmooth);
+    splitPlayer.lane += (splitPlayer.targetLane - splitPlayer.lane) * Math.min(1, dt * LANE_LERP_RATE);
+
+    splitSpawnTimerMs += dt * 1000;
+    if (splitSpawnTimerMs >= splitSpawnIntervalMs) {
+        splitSpawnTimerMs = 0;
+        splitSpawnIntervalMs = Math.max(SPLIT_SPAWN_MIN_MS, SPLIT_SPAWN_BASE_MS - score * SPLIT_SPAWN_PER_SCORE)
+            + (Math.random() * SPLIT_SPAWN_JITTER_MS * 2 - SPLIT_SPAWN_JITTER_MS);
+        spawnSplitObstacle();
+    }
+
+    const hitY = splitBaselineY();
+    for (const o of splitObstacles) {
+        o.y += splitSpeed * dt;
+
+        const spans = o.y <= hitY && hitY <= o.y + SPLIT_OBSTACLE_HEIGHT;
+        const sameLane = Math.abs(splitPlayer.lane - o.lane) < 0.5;
+        if (spans && sameLane) {
+            splitGameOver();
+            return;
+        }
+
+        if (!o.scored && o.y > hitY) {
+            o.scored = true;
+            score++;
+            splitSpeed = Math.min(SPLIT_SPEED_MAX, SPLIT_SPEED_BASE + score * SPLIT_SPEED_PER_SCORE);
+        }
+    }
+    splitObstacles = splitObstacles.filter(o => o.y < H + 40);
+}
+
+function drawSplitCalibration() {
+    const cx = W * 0.5, cy = H * 0.4;
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 24, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('LOOK STRAIGHT AHEAD', W / 2, H * 0.72);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText('THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+}
+
+function drawSplit() {
+    if (modeState !== MODE_STATE.START) {
+        const laneWidth = W / SPLIT_LANE_COUNT;
+        ctx.strokeStyle = '#242424';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(laneWidth, 0);
+        ctx.lineTo(laneWidth, H);
+        ctx.stroke();
+
+        for (const o of splitObstacles) {
+            const w = laneWidth * 0.7;
+            const x = splitLaneCenterX(o.lane) - w / 2;
+            roundRect(x, o.y, w, SPLIT_OBSTACLE_HEIGHT, 8);
+            ctx.fillStyle = '#e8763d';
+            ctx.fill();
+        }
+
+        const px = splitLaneCenterX(splitPlayer ? splitPlayer.lane : 0);
+        const py = splitBaselineY();
+        ctx.fillStyle = '#e8d83d';
+        roundRect(px - 23, py - 23, 46, 46, 12);
+        ctx.fill();
+    }
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('LOOK TO STEER', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('TAP TO START, THEN LOOK L/R', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawRecalibrateHint();
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.3);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.3 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.3 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.3 + 122);
+    }
+}
+
 // --- mode select --------------------------------------------------------
 
 function modeButtonRect(index) {
-    return { cx: W / 2, cy: H * 0.32 + index * 90, w: 240, h: 64 };
+    return { cx: W / 2, cy: H * 0.26 + index * 68, w: 240, h: 58 };
 }
 // Hints are stacked with fixed pixel spacing below each mode's own title
 // line (not a raw fraction of H) — mode-specific because how many hints
@@ -857,11 +1043,11 @@ function hintStackY(index) {
     return modeTitleBaseY() + 90 + index * 32;
 }
 function changeModeHintRect() {
-    const index = mode === 'area' ? 2 : (mode === 'full' ? 1 : 0);
+    const index = mode === 'area' ? 2 : (mode === 'split' || mode === 'full' ? 1 : 0);
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 40 };
 }
 function recalibrateHintRect() {
-    const index = mode === 'area' ? 1 : 0;
+    const index = mode === 'area' ? 1 : 0; // split and full both sit at index 0 (just RECALIBRATE + CHANGE MODE)
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 36 };
 }
 function pointInRect(x, y, r) {
@@ -897,6 +1083,9 @@ function enterMode(m) {
     else if (m === 'area') {
         if (areaCalibration) resetAreaRun();
         else startAreaCalibration();
+    } else if (m === 'split') {
+        if (splitCenter !== null) resetSplitRun();
+        else startSplitCalibration();
     } else if (m === 'full') {
         if (fullCalibration) resetFullRun();
         else startFullCalibration();
@@ -906,11 +1095,12 @@ function enterMode(m) {
 function drawModeSelect() {
     ctx.fillStyle = '#eeeeee';
     ctx.font = 'bold 20px monospace';
-    ctx.fillText('CHOOSE A MODE', W / 2, H * 0.2);
+    ctx.fillText('CHOOSE A MODE', W / 2, H * 0.1);
 
     const labels = [
         ['BLINK', 'Blink to flap'],
         ['AREA', 'Look left/center/right'],
+        ['SPLIT', 'Look left/right only'],
         ['FULL', 'Look & dwell (calibrated)'],
     ];
     labels.forEach(([name, sub], i) => {
@@ -964,21 +1154,35 @@ async function loadFaceLandmarker() {
     }
 }
 
-function tryUnlockOrientation() {
+async function tryUnlockOrientation() {
     // The app's manifest locks orientation to portrait for the whole hub
     // (every other game is touch-based and needs a one-handed portrait
     // grip) — that's a shared, app-wide setting not worth changing just for
     // this one experimental test. This best-effort call only affects THIS
-    // page's session, letting the OS rotate freely here (if the browser
-    // supports it at all outside fullscreen) without touching the manifest.
+    // page's session, without touching the manifest.
+    //
+    // A plain screen.orientation.unlock() alone did nothing on a real
+    // device — most browsers only honor orientation lock/unlock while the
+    // document is fullscreen, and this page never requested that. Request
+    // fullscreen first (this runs from the "enable camera" tap, so it has
+    // the user-gesture fullscreen requires), then unlock. Both are wrapped
+    // individually so a failure in one doesn't block the other, and neither
+    // is fatal if unsupported — physical rotation may still be blocked by
+    // the phone's own OS-level rotation-lock toggle, which is outside any
+    // page's control.
+    try {
+        if (document.documentElement.requestFullscreen) {
+            await document.documentElement.requestFullscreen();
+        }
+    } catch (err) { /* fullscreen denied/unsupported — fine, continue anyway */ }
     try {
         if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
-    } catch (err) { /* unsupported outside fullscreen on many browsers — fine, just a no-op */ }
+    } catch (err) { /* unsupported — fine, just a no-op */ }
 }
 
 async function startCameraFlow() {
     state = STATE.LOADING;
-    tryUnlockOrientation();
+    await tryUnlockOrientation();
     const camOk = await requestCamera();
     if (!camOk) { state = STATE.ERROR; return; }
     const modelOk = await loadFaceLandmarker();
@@ -1037,6 +1241,7 @@ function update(dt) {
     if (state !== STATE.IN_GAME) return;
     if (mode === 'blink') updateBlink(dt);
     else if (mode === 'area') updateArea(dt);
+    else if (mode === 'split') updateSplit(dt);
     else if (mode === 'full') updateFull(dt);
 }
 
@@ -1082,6 +1287,9 @@ function draw() {
             if (areaCalibrating) drawAreaCalibration();
             else if (areaAdjusting) drawAreaSensitivity();
             else drawArea();
+        } else if (mode === 'split') {
+            if (splitCalibrating) drawSplitCalibration();
+            else drawSplit();
         } else if (mode === 'full') {
             if (fullCalibrating) drawCalibration();
             else drawFull();
@@ -1126,13 +1334,18 @@ canvas.addEventListener('pointerdown', e => {
     if (state === STATE.MODE_SELECT) {
         if (pointInRect(x, y, modeButtonRect(0))) enterMode('blink');
         else if (pointInRect(x, y, modeButtonRect(1))) enterMode('area');
-        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('full');
+        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('split');
+        else if (pointInRect(x, y, modeButtonRect(3))) enterMode('full');
         return;
     }
 
     if (state === STATE.IN_GAME) {
         if (mode === 'area' && areaCalibrating) {
             captureAreaCalibSample();
+            return;
+        }
+        if (mode === 'split' && splitCalibrating) {
+            captureSplitCalibSample();
             return;
         }
         if (mode === 'area' && areaAdjusting) {
@@ -1162,6 +1375,10 @@ canvas.addEventListener('pointerdown', e => {
             startAreaCalibration();
             return;
         }
+        if (mode === 'split' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
+            startSplitCalibration();
+            return;
+        }
         if (mode === 'full' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
             startFullCalibration();
             return;
@@ -1172,6 +1389,9 @@ canvas.addEventListener('pointerdown', e => {
         } else if (mode === 'area') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetAreaRun();
+        } else if (mode === 'split') {
+            if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
+            else if (modeState === MODE_STATE.OVER) resetSplitRun();
         } else if (mode === 'full') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetFullRun();
