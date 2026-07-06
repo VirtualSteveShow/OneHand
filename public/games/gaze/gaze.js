@@ -268,7 +268,18 @@ let areaCalibIndex = 0;
 let areaCalibSamples = [];
 let areaCalibration = null; // { left, center, right } gazeXSmooth values, or null if never calibrated
 
-const AREA_CALIB_STEPS = ['LOOK LEFT', 'LOOK CENTER', 'LOOK RIGHT'];
+// Calibration is a brief glance-and-tap, not sustained attention — a user
+// found looking far past the screen's edge calibrates a much cleaner range
+// than a modest on-screen glance (bigger eye rotation = clearer signal).
+// That's fine here: gameplay itself only needs ~40% of whatever range gets
+// calibrated (AREA_CALIB_FRACTION) to trigger a lane change, so an extreme
+// calibration glance should translate to a comfortable, on-screen gameplay
+// glance, not require staring off-screen while actually playing.
+const AREA_CALIB_STEPS = [
+    { title: 'LOOK LEFT', hint1: 'GO AS FAR AS COMFORTABLE,', hint2: 'EVEN PAST THE SCREEN EDGE' },
+    { title: 'LOOK CENTER', hint1: 'STRAIGHT AHEAD AT THE SCREEN', hint2: '' },
+    { title: 'LOOK RIGHT', hint1: 'GO AS FAR AS COMFORTABLE,', hint2: 'EVEN PAST THE SCREEN EDGE' },
+];
 
 function startAreaCalibration() {
     areaCalibrating = true;
@@ -454,14 +465,17 @@ function drawArea() {
 }
 
 function drawAreaCalibration() {
+    const step = AREA_CALIB_STEPS[areaCalibIndex];
     ctx.textAlign = 'center';
     ctx.fillStyle = '#eeeeee';
     ctx.font = 'bold 26px monospace';
-    ctx.fillText(AREA_CALIB_STEPS[areaCalibIndex], W / 2, H * 0.42);
+    ctx.fillText(step.title, W / 2, H * 0.38);
     ctx.fillStyle = '#888888';
     ctx.font = '13px monospace';
-    ctx.fillText('HOLD YOUR GAZE, THEN TAP', W / 2, H * 0.42 + 30);
-    ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.42 + 52);
+    ctx.fillText(step.hint1, W / 2, H * 0.38 + 30);
+    ctx.fillText(step.hint2, W / 2, H * 0.38 + 50);
+    ctx.fillText('THEN TAP ANYWHERE', W / 2, H * 0.38 + 74);
+    ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.38 + 96);
 }
 
 // --- Full mode (continuous gaze-point tracking, calibrated) -----------------
