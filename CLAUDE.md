@@ -57,7 +57,7 @@ This is the entire point of the app, so it's worth being explicit about what "on
 Deliberately the same stack as `Snake` and `SpyFall` — proven to work well for this kind of small mobile-first game, zero build step, easy to iterate on:
 
 - **Server:** Python + aiohttp (static file server, local dev only — production is GitHub Pages)
-- **Frontend:** Vanilla JS/HTML/CSS, no framework, no bundler
+- **Frontend:** Vanilla JS/HTML/CSS, no framework, no bundler. **One noted exception:** `games/gaze/` dynamically imports Google's MediaPipe Tasks Vision (`FaceLandmarker`) from jsdelivr's CDN at runtime for camera-based face/blink detection — unavoidable for real face-landmark detection, still zero build step (loaded via `import()` in a classic script, no bundler needed), but it's the only game with an external dependency. Added 2026-07-05.
 - **Hosting:** GitHub Pages (static), auto-deploy via Actions on push to `master`
 - **PWA:** `manifest.json` + `sw.js` (network-first fetch, offline fallback to cache)
 - **Local SSL:** reuses the same Tailscale cert as Snake/SpyFall/Phone App, so phone testing over HTTPS works without any extra setup:
