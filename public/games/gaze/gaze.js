@@ -282,16 +282,22 @@ let areaSliderDragging = false;
 
 // Calibration is a brief glance-and-tap, not sustained attention. A user
 // first tried looking far past the screen's edge (bigger eye rotation gives
-// a cleaner signal) but found in-game triggering still required looking
-// off-screen. A second experiment — calibrating against the screen's actual
-// left/right EDGES instead of an off-screen extreme — worked better and let
-// them keep the screen in view while triggering, so that's the instruction
-// now. The sensitivity dial (areaSensitivity, adjustable from the start
-// screen) handles fine-tuning from there instead of a fixed guessed constant.
+// a cleaner signal), then found calibrating against a specific point near
+// the screen's actual edges worked better and kept the screen in view while
+// triggering — so calibration targets are drawn circles at a specific x
+// position (quite close to the true edge) rather than a vague "look at the
+// edge" instruction. The sensitivity dial (areaSensitivity, adjustable from
+// the start screen) handles fine-tuning from there instead of a fixed
+// guessed constant. fx is the calibration circle's x position as a fraction
+// of screen width — works in both portrait and landscape since it's
+// relative, and landscape's extra width spreads the left/right circles
+// further apart while keeping them on-screen (an experimental test of
+// whether that improves tracking; this project is otherwise one-handed
+// portrait-only, but gaze modes are hands-free during play).
 const AREA_CALIB_STEPS = [
-    { title: 'LOOK LEFT', hint1: 'LOOK AT THE LEFT EDGE', hint2: 'OF THE SCREEN' },
-    { title: 'LOOK CENTER', hint1: 'STRAIGHT AHEAD AT THE SCREEN', hint2: '' },
-    { title: 'LOOK RIGHT', hint1: 'LOOK AT THE RIGHT EDGE', hint2: 'OF THE SCREEN' },
+    { title: 'LOOK LEFT', fx: 0.06 },
+    { title: 'LOOK CENTER', fx: 0.5 },
+    { title: 'LOOK RIGHT', fx: 0.94 },
 ];
 
 function startAreaCalibration() {
@@ -443,29 +449,35 @@ function updateArea(dt) {
 }
 
 function drawArea() {
-    const laneWidth = W / LANE_COUNT;
-    ctx.strokeStyle = '#242424';
-    ctx.lineWidth = 1;
-    for (let i = 1; i < LANE_COUNT; i++) {
-        ctx.beginPath();
-        ctx.moveTo(laneWidth * i, 0);
-        ctx.lineTo(laneWidth * i, H);
-        ctx.stroke();
-    }
+    // The lane/player/obstacle preview is only drawn once a run is actually
+    // underway — on the START screen it competes for the same vertical
+    // space as the menu text and hints (especially bad in a short-height
+    // landscape viewport, where they visibly overlapped in testing).
+    if (modeState !== MODE_STATE.START) {
+        const laneWidth = W / LANE_COUNT;
+        ctx.strokeStyle = '#242424';
+        ctx.lineWidth = 1;
+        for (let i = 1; i < LANE_COUNT; i++) {
+            ctx.beginPath();
+            ctx.moveTo(laneWidth * i, 0);
+            ctx.lineTo(laneWidth * i, H);
+            ctx.stroke();
+        }
 
-    for (const o of areaObstacles) {
-        const w = laneWidth * 0.7;
-        const x = areaLaneCenterX(o.lane) - w / 2;
-        roundRect(x, o.y, w, AREA_OBSTACLE_HEIGHT, 8);
-        ctx.fillStyle = '#e8763d';
+        for (const o of areaObstacles) {
+            const w = laneWidth * 0.7;
+            const x = areaLaneCenterX(o.lane) - w / 2;
+            roundRect(x, o.y, w, AREA_OBSTACLE_HEIGHT, 8);
+            ctx.fillStyle = '#e8763d';
+            ctx.fill();
+        }
+
+        const px = areaLaneCenterX(areaPlayer ? areaPlayer.lane : 1);
+        const py = areaBaselineY();
+        ctx.fillStyle = '#e8d83d';
+        roundRect(px - 23, py - 23, 46, 46, 12);
         ctx.fill();
     }
-
-    const px = areaLaneCenterX(areaPlayer ? areaPlayer.lane : 1);
-    const py = areaBaselineY();
-    ctx.fillStyle = '#e8d83d';
-    roundRect(px - 23, py - 23, 46, 46, 12);
-    ctx.fill();
 
     ctx.textAlign = 'center';
 
@@ -506,20 +518,31 @@ function drawArea() {
 
 function drawAreaCalibration() {
     const step = AREA_CALIB_STEPS[areaCalibIndex];
+    const cx = step.fx * W;
+    const cy = H * 0.4;
+
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 24, 0, Math.PI * 2);
+    ctx.stroke();
+
     ctx.textAlign = 'center';
     ctx.fillStyle = '#eeeeee';
-    ctx.font = 'bold 26px monospace';
-    ctx.fillText(step.title, W / 2, H * 0.38);
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(step.title, W / 2, H * 0.72);
     ctx.fillStyle = '#888888';
     ctx.font = '13px monospace';
-    ctx.fillText(step.hint1, W / 2, H * 0.38 + 30);
-    ctx.fillText(step.hint2, W / 2, H * 0.38 + 50);
-    ctx.fillText('THEN TAP ANYWHERE', W / 2, H * 0.38 + 74);
-    ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.38 + 96);
+    ctx.fillText('LOOK AT THE DOT, THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+    ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.72 + 48);
 }
 
 function sensitivityHintRect() {
-    return { cx: W / 2, cy: H * 0.64, w: 220, h: 36 };
+    return { cx: W / 2, cy: hintStackY(0), w: 220, h: 36 };
 }
 function drawSensitivityHint() {
     const r = sensitivityHintRect();
@@ -821,11 +844,25 @@ function drawFull() {
 function modeButtonRect(index) {
     return { cx: W / 2, cy: H * 0.32 + index * 90, w: 240, h: 64 };
 }
+// Hints are stacked with fixed pixel spacing below each mode's own title
+// line (not a raw fraction of H) — mode-specific because how many hints
+// precede a given one (SENSITIVITY/RECALIBRATE/CHANGE MODE for Area vs just
+// RECALIBRATE/CHANGE MODE for Full vs only CHANGE MODE for Blink) differs,
+// and fixed pixel gaps hold up far better than H-fractions when H is small
+// (a landscape viewport, tested with Area's experimental landscape support).
+function modeTitleBaseY() {
+    return mode === 'full' ? H * 0.3 : H * 0.36;
+}
+function hintStackY(index) {
+    return modeTitleBaseY() + 90 + index * 32;
+}
 function changeModeHintRect() {
-    return { cx: W / 2, cy: H * 0.8, w: 220, h: 40 };
+    const index = mode === 'area' ? 2 : (mode === 'full' ? 1 : 0);
+    return { cx: W / 2, cy: hintStackY(index), w: 220, h: 40 };
 }
 function recalibrateHintRect() {
-    return { cx: W / 2, cy: H * 0.72, w: 220, h: 36 };
+    const index = mode === 'area' ? 1 : 0;
+    return { cx: W / 2, cy: hintStackY(index), w: 220, h: 36 };
 }
 function pointInRect(x, y, r) {
     return Math.abs(x - r.cx) < r.w / 2 && Math.abs(y - r.cy) < r.h / 2;
@@ -848,6 +885,14 @@ function drawRecalibrateHint() {
 function enterMode(m) {
     mode = m;
     state = STATE.IN_GAME;
+    // Defensive: the calibration-entry branches below don't themselves touch
+    // modeState (only the reset*Run() functions do), so without this a mode
+    // switch away from an active PLAYING run could leave the new mode's
+    // update() running past its "if (modeState !== PLAYING) return" guard
+    // against not-yet-initialized state (e.g. Full's fullTarget). Not
+    // reachable through the normal UI today (mode-switch is only tappable
+    // while modeState is already START), but cheap to make foolproof.
+    modeState = MODE_STATE.START;
     if (m === 'blink') resetBlinkRun();
     else if (m === 'area') {
         if (areaCalibration) resetAreaRun();
@@ -919,8 +964,21 @@ async function loadFaceLandmarker() {
     }
 }
 
+function tryUnlockOrientation() {
+    // The app's manifest locks orientation to portrait for the whole hub
+    // (every other game is touch-based and needs a one-handed portrait
+    // grip) — that's a shared, app-wide setting not worth changing just for
+    // this one experimental test. This best-effort call only affects THIS
+    // page's session, letting the OS rotate freely here (if the browser
+    // supports it at all outside fullscreen) without touching the manifest.
+    try {
+        if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+    } catch (err) { /* unsupported outside fullscreen on many browsers — fine, just a no-op */ }
+}
+
 async function startCameraFlow() {
     state = STATE.LOADING;
+    tryUnlockOrientation();
     const camOk = await requestCamera();
     if (!camOk) { state = STATE.ERROR; return; }
     const modelOk = await loadFaceLandmarker();
