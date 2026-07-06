@@ -1,4 +1,4 @@
-const CACHE = 'onehand-v10';
+const CACHE = 'onehand-v11';
 // HTML is not pre-cached — always fetched fresh from network
 const ASSETS = [
     'style.css', 'hub.js', 'manifest.json',

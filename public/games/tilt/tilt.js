@@ -1,17 +1,17 @@
 'use strict';
 
-// One-handed contract: a new gesture primitive — hold + tilt. Press and hold
-// anywhere (no drag, no fixed target — just presence of a touch) to arm the
-// gyro; while held, tilting the phone left/right steers the ball. Release
-// freezes it in place. This is the one primitive that reads a device sensor
-// instead of touch geometry, which this project's own CLAUDE.md flags as
-// risky in general (a hand holding a baby is also gently rocking
-// unpredictably). Two mitigations specifically for that: (1) the tilt is
-// only ever read while a finger is actively down — no passive/always-on
-// sensing — and (2) every single press recalibrates a fresh zero-point from
-// whatever angle the phone happens to be at that moment, so an unusual
-// resting grip (or drift between plays) never becomes false input; only
-// deliberate tilting relative to your own current grip moves the ball.
+// One-handed contract: a new gesture primitive — pure tilt, zero touch
+// required once a run is going. Tap once to start (unavoidable — every game
+// in this hub starts that way), then tilt the phone left/right to steer
+// continuously; no finger needs to stay on the glass. This is the one
+// primitive that reads a device sensor instead of touch geometry, which
+// this project's own CLAUDE.md flags as risky in general (a hand holding a
+// baby is also gently rocking unpredictably). Since always-on tilt reading
+// is exactly what was flagged, the remaining mitigations are: a single
+// tilt axis only (left/right, not the more jitter-prone forward/back), a
+// deadzone around zero, and a fresh calibration of the zero-point every
+// time a run starts (from whatever angle the phone happens to be held at
+// that moment) so an unusual resting grip never itself becomes an offset.
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -56,8 +56,7 @@ let permissionDenied = false;
 let ballX, obstacles, score, best, spawnTimerMs, spawnIntervalMs, obstSpeed, lastTime;
 
 let currentGamma = 0;   // last raw gamma reading
-let gyroActive = false; // only true while a finger is down
-let zeroGamma = 0;      // calibrated at the moment of the most recent press
+let zeroGamma = 0;      // calibrated once, at the moment the run starts
 
 function loadBest() { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10); }
 function saveBest(v) { localStorage.setItem(BEST_KEY, String(v)); }
@@ -100,15 +99,6 @@ function gameOver() {
     saveBest(best);
 }
 
-function armGyro() {
-    gyroActive = true;
-    zeroGamma = currentGamma;
-}
-
-function disarmGyro() {
-    gyroActive = false;
-}
-
 async function press() {
     if (state === STATE.START) {
         const ok = await ensureGyroPermission();
@@ -119,16 +109,10 @@ async function press() {
         permissionDenied = false;
         state = STATE.PLAYING;
         resetRun();
-        armGyro();
+        zeroGamma = currentGamma;
     } else if (state === STATE.OVER) {
         reset();
-    } else if (state === STATE.PLAYING) {
-        armGyro();
     }
-}
-
-function release() {
-    disarmGyro();
 }
 
 function spawnObstacle() {
@@ -140,14 +124,12 @@ function spawnObstacle() {
 function update(dt) {
     if (state !== STATE.PLAYING) return;
 
-    if (gyroActive) {
-        let delta = currentGamma - zeroGamma;
-        if (Math.abs(delta) < GAMMA_DEADZONE) delta = 0;
-        delta = Math.max(-GAMMA_SENSITIVITY, Math.min(GAMMA_SENSITIVITY, delta));
-        const frac = delta / GAMMA_SENSITIVITY;
-        const margin = BALL_RADIUS + 16;
-        ballX = W / 2 + frac * (W / 2 - margin);
-    }
+    let delta = currentGamma - zeroGamma;
+    if (Math.abs(delta) < GAMMA_DEADZONE) delta = 0;
+    delta = Math.max(-GAMMA_SENSITIVITY, Math.min(GAMMA_SENSITIVITY, delta));
+    const frac = delta / GAMMA_SENSITIVITY;
+    const margin = BALL_RADIUS + 16;
+    ballX = W / 2 + frac * (W / 2 - margin);
 
     spawnTimerMs += dt * 1000;
     if (spawnTimerMs >= spawnIntervalMs) {
@@ -229,10 +211,10 @@ function draw() {
             ctx.font = '13px monospace';
             ctx.fillText('ALLOW MOTION ACCESS, THEN TAP', W / 2, H * 0.4 + 28);
         } else {
-            ctx.fillText('HOLD & TILT', W / 2, H * 0.4);
+            ctx.fillText('TILT TO STEER', W / 2, H * 0.4);
             ctx.fillStyle = '#888888';
             ctx.font = '13px monospace';
-            ctx.fillText('STEER LEFT / RIGHT', W / 2, H * 0.4 + 28);
+            ctx.fillText('TAP TO START, NO HOLDING NEEDED', W / 2, H * 0.4 + 28);
             if (best > 0) {
                 ctx.fillText('BEST ' + best, W / 2, H * 0.4 + 50);
             }
@@ -272,8 +254,3 @@ canvas.addEventListener('pointerdown', e => {
     e.preventDefault();
     press();
 });
-canvas.addEventListener('pointerup', e => {
-    e.preventDefault();
-    release();
-});
-canvas.addEventListener('pointercancel', () => { release(); });
