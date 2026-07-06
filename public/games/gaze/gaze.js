@@ -246,8 +246,18 @@ const GAZE_THRESHOLD = 0.10;  // fallback only, used if somehow uncalibrated
 // (camera angle, individual anatomy, etc.) — a user found "right" was much
 // harder to trigger than "left" with the fixed threshold. Calibrating
 // against this user's own observed left/center/right range fixes that
-// regardless of the underlying cause.
-const AREA_CALIB_FRACTION = 0.4;   // trigger at 40% of the way from center to your calibrated extreme
+// regardless of the underlying cause. How much of that calibrated range is
+// needed to actually trigger is now a live, user-adjustable "sensitivity"
+// dial (areaSensitivity) rather than a fixed constant — the right fraction
+// turned out to depend heavily on what the calibration points themselves
+// were (an off-screen glance needs a smaller fraction than an edge-of-screen
+// glance), so letting the user tune it directly beats guessing one number.
+const AREA_SENS_KEY = 'onehand-gaze-area-sensitivity';
+const AREA_SENS_MIN = 0.2;
+const AREA_SENS_MAX = 1.0;
+const AREA_SENS_DEFAULT = 0.6;
+let areaSensitivity = parseFloat(localStorage.getItem(AREA_SENS_KEY)) || AREA_SENS_DEFAULT;
+
 const AREA_CALIB_MIN_OFFSET = 0.04; // safety floor in case a calibration sample was too close to center
 
 const AREA_OBSTACLE_HEIGHT = 50;
@@ -267,18 +277,21 @@ let areaCalibrating = false;
 let areaCalibIndex = 0;
 let areaCalibSamples = [];
 let areaCalibration = null; // { left, center, right } gazeXSmooth values, or null if never calibrated
+let areaAdjusting = false;   // in the sensitivity-slider screen
+let areaSliderDragging = false;
 
-// Calibration is a brief glance-and-tap, not sustained attention — a user
-// found looking far past the screen's edge calibrates a much cleaner range
-// than a modest on-screen glance (bigger eye rotation = clearer signal).
-// That's fine here: gameplay itself only needs ~40% of whatever range gets
-// calibrated (AREA_CALIB_FRACTION) to trigger a lane change, so an extreme
-// calibration glance should translate to a comfortable, on-screen gameplay
-// glance, not require staring off-screen while actually playing.
+// Calibration is a brief glance-and-tap, not sustained attention. A user
+// first tried looking far past the screen's edge (bigger eye rotation gives
+// a cleaner signal) but found in-game triggering still required looking
+// off-screen. A second experiment — calibrating against the screen's actual
+// left/right EDGES instead of an off-screen extreme — worked better and let
+// them keep the screen in view while triggering, so that's the instruction
+// now. The sensitivity dial (areaSensitivity, adjustable from the start
+// screen) handles fine-tuning from there instead of a fixed guessed constant.
 const AREA_CALIB_STEPS = [
-    { title: 'LOOK LEFT', hint1: 'GO AS FAR AS COMFORTABLE,', hint2: 'EVEN PAST THE SCREEN EDGE' },
+    { title: 'LOOK LEFT', hint1: 'LOOK AT THE LEFT EDGE', hint2: 'OF THE SCREEN' },
     { title: 'LOOK CENTER', hint1: 'STRAIGHT AHEAD AT THE SCREEN', hint2: '' },
-    { title: 'LOOK RIGHT', hint1: 'GO AS FAR AS COMFORTABLE,', hint2: 'EVEN PAST THE SCREEN EDGE' },
+    { title: 'LOOK RIGHT', hint1: 'LOOK AT THE RIGHT EDGE', hint2: 'OF THE SCREEN' },
 ];
 
 function startAreaCalibration() {
@@ -331,11 +344,37 @@ function classifyGazeLane(smoothed) {
         return 1;
     }
     const { left, center, right } = areaCalibration;
-    const leftThresh = Math.min(center - AREA_CALIB_MIN_OFFSET, center + (left - center) * AREA_CALIB_FRACTION);
-    const rightThresh = Math.max(center + AREA_CALIB_MIN_OFFSET, center + (right - center) * AREA_CALIB_FRACTION);
+    const leftThresh = Math.min(center - AREA_CALIB_MIN_OFFSET, center + (left - center) * areaSensitivity);
+    const rightThresh = Math.max(center + AREA_CALIB_MIN_OFFSET, center + (right - center) * areaSensitivity);
     if (smoothed < leftThresh) return 0;
     if (smoothed > rightThresh) return 2;
     return 1;
+}
+
+function setAreaSensitivity(v) {
+    areaSensitivity = Math.max(AREA_SENS_MIN, Math.min(AREA_SENS_MAX, v));
+    localStorage.setItem(AREA_SENS_KEY, String(areaSensitivity));
+}
+
+function sliderTrackRect() {
+    return { x1: 40, x2: W - 40, y: H * 0.42 };
+}
+function sensitivityToX(sens) {
+    const t = sliderTrackRect();
+    const frac = (sens - AREA_SENS_MIN) / (AREA_SENS_MAX - AREA_SENS_MIN);
+    return t.x1 + frac * (t.x2 - t.x1);
+}
+function xToSensitivity(x) {
+    const t = sliderTrackRect();
+    const frac = Math.max(0, Math.min(1, (x - t.x1) / (t.x2 - t.x1)));
+    return AREA_SENS_MIN + frac * (AREA_SENS_MAX - AREA_SENS_MIN);
+}
+function inSliderZone(x, y) {
+    const t = sliderTrackRect();
+    return y > t.y - 30 && y < t.y + 30 && x > t.x1 - 20 && x < t.x2 + 20;
+}
+function doneButtonRect() {
+    return { cx: W / 2, cy: H * 0.72, w: 160, h: 44 };
 }
 
 function areaP2(currentScore) {
@@ -444,6 +483,7 @@ function drawArea() {
         ctx.font = '13px monospace';
         ctx.fillText('TAP TO START, THEN LOOK L/C/R', W / 2, H * 0.36 + 28);
         if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawSensitivityHint();
         drawRecalibrateHint();
         drawChangeModeHint();
     }
@@ -476,6 +516,73 @@ function drawAreaCalibration() {
     ctx.fillText(step.hint2, W / 2, H * 0.38 + 50);
     ctx.fillText('THEN TAP ANYWHERE', W / 2, H * 0.38 + 74);
     ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.38 + 96);
+}
+
+function sensitivityHintRect() {
+    return { cx: W / 2, cy: H * 0.64, w: 220, h: 36 };
+}
+function drawSensitivityHint() {
+    const r = sensitivityHintRect();
+    ctx.fillStyle = '#666666';
+    ctx.font = '12px monospace';
+    ctx.fillText('SENSITIVITY', r.cx, r.cy + 4);
+}
+
+function drawAreaSensitivity() {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('SENSITIVITY', W / 2, H * 0.28);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText('DRAG TO ADJUST, LOOK TO TEST', W / 2, H * 0.28 + 26);
+
+    const t = sliderTrackRect();
+    ctx.strokeStyle = '#333333';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(t.x1, t.y);
+    ctx.lineTo(t.x2, t.y);
+    ctx.stroke();
+
+    const hx = sensitivityToX(areaSensitivity);
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(hx, t.y, 14, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#666666';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('EASIER', t.x1, t.y + 28);
+    ctx.textAlign = 'right';
+    ctx.fillText('HARDER', t.x2, t.y + 28);
+    ctx.textAlign = 'center';
+
+    // live preview: which lane your current gaze classifies as, right now
+    const lane = classifyGazeLane(gazeXSmooth);
+    const labels = ['L', 'C', 'R'];
+    const py = H * 0.56;
+    for (let i = 0; i < 3; i++) {
+        const px = W / 2 + (i - 1) * 70;
+        const active = i === lane;
+        ctx.strokeStyle = active ? '#4ec97a' : '#333333';
+        ctx.lineWidth = 3;
+        roundRect(px - 28, py - 28, 56, 56, 10);
+        ctx.stroke();
+        ctx.fillStyle = active ? '#4ec97a' : '#666666';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText(labels[i], px, py + 8);
+    }
+
+    const d = doneButtonRect();
+    ctx.strokeStyle = '#e8d83d';
+    ctx.lineWidth = 2;
+    roundRect(d.cx - d.w / 2, d.cy - d.h / 2, d.w, d.h, 10);
+    ctx.stroke();
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText('DONE', d.cx, d.cy + 5);
 }
 
 // --- Full mode (continuous gaze-point tracking, calibrated) -----------------
@@ -915,6 +1022,7 @@ function draw() {
         if (mode === 'blink') drawBlink();
         else if (mode === 'area') {
             if (areaCalibrating) drawAreaCalibration();
+            else if (areaAdjusting) drawAreaSensitivity();
             else drawArea();
         } else if (mode === 'full') {
             if (fullCalibrating) drawCalibration();
@@ -969,12 +1077,27 @@ canvas.addEventListener('pointerdown', e => {
             captureAreaCalibSample();
             return;
         }
+        if (mode === 'area' && areaAdjusting) {
+            if (pointInRect(x, y, doneButtonRect())) {
+                areaAdjusting = false;
+                return;
+            }
+            if (inSliderZone(x, y)) {
+                areaSliderDragging = true;
+                setAreaSensitivity(xToSensitivity(x));
+            }
+            return;
+        }
         if (mode === 'full' && fullCalibrating) {
             captureCalibSample();
             return;
         }
         if (modeState === MODE_STATE.START && pointInRect(x, y, changeModeHintRect())) {
             state = STATE.MODE_SELECT;
+            return;
+        }
+        if (mode === 'area' && modeState === MODE_STATE.START && pointInRect(x, y, sensitivityHintRect())) {
+            areaAdjusting = true;
             return;
         }
         if (mode === 'area' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
@@ -997,3 +1120,12 @@ canvas.addEventListener('pointerdown', e => {
         }
     }
 });
+
+canvas.addEventListener('pointermove', e => {
+    if (areaSliderDragging) {
+        e.preventDefault();
+        setAreaSensitivity(xToSensitivity(e.clientX));
+    }
+});
+canvas.addEventListener('pointerup', () => { areaSliderDragging = false; });
+canvas.addEventListener('pointercancel', () => { areaSliderDragging = false; });
