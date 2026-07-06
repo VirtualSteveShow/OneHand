@@ -843,10 +843,15 @@ function drawFull() {
 //
 // User feedback on Area: juggling 3 zones (left/center/right) felt less
 // certain than a clean binary choice. Split removes the center zone
-// entirely — classification is a pure sign test relative to a single
-// calibrated center point, no sensitivity fraction to tune at all, since
-// there's no longer a "how close to the extreme" question. Calibration is
-// a single "look center" step instead of Area's three.
+// entirely — classification is a pure sign test relative to a calibrated
+// midpoint, no sensitivity fraction to tune at all, since there's no longer
+// a "how close to the extreme" question, just which side you're on.
+//
+// Calibration was originally a single "look center" sample, but that's one
+// noisy data point with no anchor to the user's actual left/right range.
+// Switched to LOOK LEFT / LOOK RIGHT circles (same style as Area/Full),
+// taking their midpoint as the split boundary — more robust, and matches
+// what already worked for Area.
 
 const SPLIT_BEST_KEY = 'onehand-gaze-split-best';
 const SPLIT_LANE_COUNT = 2;
@@ -861,9 +866,16 @@ const SPLIT_SPAWN_MIN_MS = 650;
 const SPLIT_SPAWN_PER_SCORE = 15;
 const SPLIT_SPAWN_JITTER_MS = 150;
 
+const SPLIT_CALIB_STEPS = [
+    { title: 'LOOK LEFT', fx: 0.06 },
+    { title: 'LOOK RIGHT', fx: 0.94 },
+];
+
 let splitPlayer, splitObstacles, splitSpawnTimerMs, splitSpawnIntervalMs, splitSpeed;
 let splitCalibrating = false;
-let splitCenter = null; // calibrated gazeXSmooth value representing "straight ahead", or null if never calibrated
+let splitCalibIndex = 0;
+let splitCalibSamples = [];
+let splitCenter = null; // midpoint of the calibrated left/right gazeXSmooth values, or null if never calibrated
 
 function splitLaneCenterX(lane) {
     const laneWidth = W / SPLIT_LANE_COUNT;
@@ -878,12 +890,19 @@ function classifySplitLane(smoothed) {
 
 function startSplitCalibration() {
     splitCalibrating = true;
+    splitCalibIndex = 0;
+    splitCalibSamples = [];
 }
 
 function captureSplitCalibSample() {
-    splitCenter = gazeXSmooth;
-    splitCalibrating = false;
-    resetSplitRun();
+    splitCalibSamples.push(gazeXSmooth);
+    splitCalibIndex++;
+    if (splitCalibIndex >= SPLIT_CALIB_STEPS.length) {
+        const [left, right] = splitCalibSamples;
+        splitCenter = (left + right) / 2;
+        splitCalibrating = false;
+        resetSplitRun();
+    }
 }
 
 function resetSplitRun() {
@@ -944,7 +963,9 @@ function updateSplit(dt) {
 }
 
 function drawSplitCalibration() {
-    const cx = W * 0.5, cy = H * 0.4;
+    const step = SPLIT_CALIB_STEPS[splitCalibIndex];
+    const cx = step.fx * W, cy = H * 0.4;
+
     ctx.fillStyle = '#e8d83d';
     ctx.beginPath();
     ctx.arc(cx, cy, 16, 0, Math.PI * 2);
@@ -958,10 +979,11 @@ function drawSplitCalibration() {
     ctx.textAlign = 'center';
     ctx.fillStyle = '#eeeeee';
     ctx.font = 'bold 20px monospace';
-    ctx.fillText('LOOK STRAIGHT AHEAD', W / 2, H * 0.72);
+    ctx.fillText(step.title, W / 2, H * 0.72);
     ctx.fillStyle = '#888888';
     ctx.font = '13px monospace';
-    ctx.fillText('THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+    ctx.fillText('LOOK AT THE DOT, THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+    ctx.fillText((splitCalibIndex + 1) + ' / ' + SPLIT_CALIB_STEPS.length, W / 2, H * 0.72 + 48);
 }
 
 function drawSplit() {
@@ -1079,6 +1101,11 @@ function enterMode(m) {
     // reachable through the normal UI today (mode-switch is only tappable
     // while modeState is already START), but cheap to make foolproof.
     modeState = MODE_STATE.START;
+    if (m === 'area' || m === 'split') {
+        tryLockLandscape();
+    } else {
+        try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (err) { /* no-op */ }
+    }
     if (m === 'blink') resetBlinkRun();
     else if (m === 'area') {
         if (areaCalibration) resetAreaRun();
@@ -1178,6 +1205,27 @@ async function tryUnlockOrientation() {
     try {
         if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
     } catch (err) { /* unsupported — fine, just a no-op */ }
+}
+
+async function tryLockLandscape() {
+    // unlock() alone still wasn't enough on a real device — most likely the
+    // phone's own OS-level auto-rotate toggle is off, and no page can force
+    // a *physical* rotation to register if the OS itself won't rotate the
+    // display at all. Explicitly locking to landscape instead works around
+    // that: it forces the page's rendering into landscape regardless of the
+    // auto-rotate setting, so the user then physically turns the phone
+    // sideways to view it comfortably — which is exactly the physical
+    // rotation this is meant to test. Scoped to Area/Split (the two modes
+    // that actually benefit from the extra width) rather than applied
+    // globally.
+    try {
+        if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
+            await document.documentElement.requestFullscreen();
+        }
+    } catch (err) { /* fullscreen denied/unsupported — fine, continue anyway */ }
+    try {
+        if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape');
+    } catch (err) { /* unsupported/denied — fine, just a no-op; check the phone's own auto-rotate setting */ }
 }
 
 async function startCameraFlow() {
