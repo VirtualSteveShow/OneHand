@@ -9,14 +9,20 @@
 // proved swipe, Charge proved hold; this proves the floating radial drag.
 //
 // The wheel widget can spawn anywhere you press, but the playfield (ring +
-// inbound debris) stays fixed in the upper-middle of the screen so your
+// inbound rings) stays fixed in the upper-middle of the screen so your
 // thumb and the wheel graphic never cover the action you're watching.
+//
+// Rings close in from fully off-screen (spawn radius covers the farthest
+// screen corner from the playfield center, regardless of aspect ratio) —
+// each one is almost a complete circle with exactly one gap; rotate to
+// align your position with that gap before the ring reaches you. The gap
+// narrows as score climbs — literally threading a shrinking needle.
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
 let W, H, DPR;
-let ORBIT_R, PLAYFIELD_CX, PLAYFIELD_CY, METEOR_SPAWN_R;
+let ORBIT_R, PLAYFIELD_CX, PLAYFIELD_CY, RING_SPAWN_R;
 
 function resize() {
     DPR = window.devicePixelRatio || 1;
@@ -29,9 +35,15 @@ function resize() {
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
     ORBIT_R = Math.min(W, H) * 0.18;
-    METEOR_SPAWN_R = Math.min(ORBIT_R * 2.1, W / 2 - 16);
     PLAYFIELD_CX = W / 2;
-    PLAYFIELD_CY = Math.max(METEOR_SPAWN_R + 16, H * 0.3);
+    PLAYFIELD_CY = H * 0.32;
+    // Farthest any screen corner can be from the playfield center, plus a
+    // margin, guarantees the ring is fully off-screen the instant it spawns.
+    const cornerDist = Math.hypot(
+        Math.max(PLAYFIELD_CX, W - PLAYFIELD_CX),
+        Math.max(PLAYFIELD_CY, H - PLAYFIELD_CY)
+    );
+    RING_SPAWN_R = cornerDist + 40;
 }
 window.addEventListener('resize', resize);
 resize();
@@ -40,15 +52,19 @@ const DEADZONE = 14;         // px, ignore tiny jitter right at the press point
 const HANDLE_MAX_R = 55;     // px, visual clamp for the wheel's handle
 const WHEEL_R = 70;          // px, visual radius of the wheel graphic
 
-const PLAYER_TOL = 0.24;     // rad, half-width of the player's safe arc
-const METEOR_TOL = 0.16;     // rad, half-width of a meteor's danger arc
+const PLAYER_TOL = 0.20;     // rad, half-width of the player's own footprint
 
-const MET_BASE_SPEED = 130;  // px/s, radius shrink rate
-const MET_MAX_SPEED = 320;
-const MET_SPEED_PER_SCORE = 6;
+// The gap (safe opening) shrinks with score — the "shrinking needle".
+const GAP_TOL_BASE = 0.55;   // rad, half-width of the gap at score 0
+const GAP_TOL_MIN = 0.28;    // rad, floor — always comfortably wider than PLAYER_TOL
+const GAP_TOL_PER_SCORE = 0.015;
 
-const SPAWN_BASE_MS = 1300;
-const SPAWN_MIN_MS = 650;
+const RING_SPEED_BASE = 130;  // px/s, radius shrink rate
+const RING_SPEED_MAX = 320;
+const RING_SPEED_PER_SCORE = 6;
+
+const SPAWN_BASE_MS = 1500;
+const SPAWN_MIN_MS = 750;
 const SPAWN_PER_SCORE = 18;
 const SPAWN_JITTER_MS = 150;
 
@@ -60,7 +76,7 @@ let state = STATE.START;
 let playerTheta = -Math.PI / 2;
 let wheelActive = false, wheelCenter = { x: 0, y: 0 };
 
-let meteors, score, best, spawnTimerMs, spawnIntervalMs, metSpeed, lastTime;
+let rings, score, best, spawnTimerMs, spawnIntervalMs, ringSpeed, lastTime;
 
 function loadBest() { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10); }
 function saveBest(v) { localStorage.setItem(BEST_KEY, String(v)); }
@@ -72,12 +88,16 @@ function angleDiff(a, b) {
     return d;
 }
 
+function currentGapTol(currentScore) {
+    return Math.max(GAP_TOL_MIN, GAP_TOL_BASE - currentScore * GAP_TOL_PER_SCORE);
+}
+
 function resetRun() {
-    meteors = [];
+    rings = [];
     score = 0;
     spawnTimerMs = 0;
     spawnIntervalMs = SPAWN_BASE_MS;
-    metSpeed = MET_BASE_SPEED;
+    ringSpeed = RING_SPEED_BASE;
     playerTheta = -Math.PI / 2;
 }
 
@@ -86,9 +106,10 @@ function reset() {
     state = STATE.START;
 }
 
-function spawnMeteor() {
-    const angle = Math.random() * Math.PI * 2;
-    meteors.push({ angle, r: METEOR_SPAWN_R, resolved: false });
+function spawnRing() {
+    const gapAngle = Math.random() * Math.PI * 2;
+    const gapTol = currentGapTol(score);
+    rings.push({ gapAngle, gapTol, r: RING_SPAWN_R, resolved: false });
 }
 
 function gameOver() {
@@ -132,22 +153,23 @@ function update(dt) {
         spawnTimerMs = 0;
         spawnIntervalMs = Math.max(SPAWN_MIN_MS, SPAWN_BASE_MS - score * SPAWN_PER_SCORE)
             + (Math.random() * SPAWN_JITTER_MS * 2 - SPAWN_JITTER_MS);
-        spawnMeteor();
+        spawnRing();
     }
 
-    for (const m of meteors) {
-        m.r -= metSpeed * dt;
-        if (!m.resolved && m.r <= ORBIT_R) {
-            m.resolved = true;
-            if (Math.abs(angleDiff(m.angle, playerTheta)) < (PLAYER_TOL + METEOR_TOL)) {
+    for (const ring of rings) {
+        ring.r -= ringSpeed * dt;
+        if (!ring.resolved && ring.r <= ORBIT_R) {
+            ring.resolved = true;
+            const threadsGap = (Math.abs(angleDiff(playerTheta, ring.gapAngle)) + PLAYER_TOL) < ring.gapTol;
+            if (!threadsGap) {
                 gameOver();
                 return;
             }
             score++;
-            metSpeed = Math.min(MET_MAX_SPEED, MET_BASE_SPEED + score * MET_SPEED_PER_SCORE);
+            ringSpeed = Math.min(RING_SPEED_MAX, RING_SPEED_BASE + score * RING_SPEED_PER_SCORE);
         }
     }
-    meteors = meteors.filter(m => !m.resolved);
+    rings = rings.filter(ring => !ring.resolved);
 }
 
 function draw() {
@@ -162,13 +184,14 @@ function draw() {
     ctx.arc(PLAYFIELD_CX, PLAYFIELD_CY, ORBIT_R, 0, Math.PI * 2);
     ctx.stroke();
 
-    // meteors — drawn as arcs so their angular danger-width is visible
+    // rings — drawn as almost-complete circles with one gap (the safe opening)
     ctx.strokeStyle = '#e8935d';
     ctx.lineWidth = 16;
-    ctx.lineCap = 'butt';
-    for (const m of meteors) {
+    ctx.lineCap = 'round';
+    for (const ring of rings) {
+        const r = Math.max(4, ring.r);
         ctx.beginPath();
-        ctx.arc(PLAYFIELD_CX, PLAYFIELD_CY, Math.max(4, m.r), m.angle - METEOR_TOL, m.angle + METEOR_TOL);
+        ctx.arc(PLAYFIELD_CX, PLAYFIELD_CY, r, ring.gapAngle + ring.gapTol, ring.gapAngle - ring.gapTol + Math.PI * 2);
         ctx.stroke();
     }
 
@@ -216,7 +239,7 @@ function draw() {
         ctx.fillText('HOLD & SPIN', W / 2, H * 0.68);
         ctx.fillStyle = '#888888';
         ctx.font = '13px monospace';
-        ctx.fillText('DODGE THE DEBRIS', W / 2, H * 0.68 + 26);
+        ctx.fillText('THREAD THE GAP', W / 2, H * 0.68 + 26);
         if (best > 0) {
             ctx.fillText('BEST ' + best, W / 2, H * 0.68 + 48);
         }

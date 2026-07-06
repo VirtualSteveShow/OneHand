@@ -2,9 +2,15 @@
 
 // One-handed contract: swipe-only gameplay — left/right = change lane, up =
 // jump, down = duck. Tap is only used for start/retry menu transitions (Flap
-// is the tap-only sibling to this game's swipe-only one). Only one obstacle
-// spawns at a time, always leaving two clear lanes, so a lane switch is
-// always a valid escape even if a jump/duck swipe comes in too late.
+// is the tap-only sibling to this game's swipe-only one).
+//
+// Obstacles spawn as a "row" that can occupy 1, 2, or 3 lanes at once (more
+// lanes as score climbs), not always just 1 — otherwise a lane switch alone
+// is always a trivial escape and jump/duck barely matter. Fairness is kept
+// two ways: rows filling only 1 or 2 lanes can use any obstacle type, since
+// at least one lane stays empty as a guaranteed escape; a row filling all 3
+// lanes never includes the lane-switch-only 'full' type, so whichever lane
+// the player is in always has a jump/duck answer.
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -53,6 +59,7 @@ const STATE = { START: 'start', PLAYING: 'playing', OVER: 'over' };
 let state = STATE.START;
 
 let player, obstacles, score, best, spawnTimerMs, spawnIntervalMs, speed, lastTime;
+let rowRemaining, nextRowId;
 
 function loadBest() { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10); }
 function saveBest(v) { localStorage.setItem(BEST_KEY, String(v)); }
@@ -73,6 +80,8 @@ function resetRun() {
     spawnTimerMs = 0;
     spawnIntervalMs = SPAWN_BASE_MS;
     speed = BASE_SPEED;
+    rowRemaining = new Map();
+    nextRowId = 0;
 }
 
 function reset() {
@@ -80,20 +89,48 @@ function reset() {
     state = STATE.START;
 }
 
-function pickType() {
-    const r = Math.random();
+function pickType(excludeFull) {
+    const weights = excludeFull ? TYPE_WEIGHTS.filter(([t]) => t !== 'full') : TYPE_WEIGHTS;
+    const total = weights.reduce((sum, [, w]) => sum + w, 0);
+    const r = Math.random() * total;
     let acc = 0;
-    for (const [type, weight] of TYPE_WEIGHTS) {
+    for (const [type, weight] of weights) {
         acc += weight;
         if (r <= acc) return type;
     }
-    return 'low';
+    return weights[weights.length - 1][0];
 }
 
-function spawnObstacle() {
-    const type = pickType();
-    const lane = Math.floor(Math.random() * LANE_COUNT);
-    obstacles.push({ type, lane, y: -OBSTACLE_TYPES[type].height, scored: false });
+function pickRowLaneCount(currentScore) {
+    const p2 = Math.min(0.55, 0.15 + currentScore * 0.03);
+    const p3 = Math.min(0.35, Math.max(0, (currentScore - 6) * 0.03));
+    const p1 = Math.max(0.05, 1 - p2 - p3);
+    const total = p1 + p2 + p3;
+    const r = Math.random() * total;
+    if (r < p1) return 1;
+    if (r < p1 + p2) return 2;
+    return 3;
+}
+
+function shuffledLanes() {
+    const lanes = [0, 1, 2];
+    for (let i = lanes.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [lanes[i], lanes[j]] = [lanes[j], lanes[i]];
+    }
+    return lanes;
+}
+
+function spawnRow() {
+    const count = pickRowLaneCount(score);
+    const lanes = shuffledLanes().slice(0, count);
+    const excludeFull = count === LANE_COUNT;
+    const rowId = nextRowId++;
+    rowRemaining.set(rowId, lanes.length);
+    for (const lane of lanes) {
+        const type = pickType(excludeFull);
+        obstacles.push({ type, lane, y: -OBSTACLE_TYPES[type].height, scored: false, rowId });
+    }
 }
 
 function gameOver() {
@@ -138,7 +175,7 @@ function update(dt, time) {
         spawnTimerMs = 0;
         spawnIntervalMs = Math.max(SPAWN_MIN_MS, SPAWN_BASE_MS - score * SPAWN_PER_SCORE)
             + (Math.random() * SPAWN_JITTER_MS * 2 - SPAWN_JITTER_MS);
-        spawnObstacle();
+        spawnRow();
     }
 
     const hitY = baselineY();
@@ -160,8 +197,14 @@ function update(dt, time) {
 
         if (!o.scored && o.y > hitY) {
             o.scored = true;
-            score++;
-            speed = Math.min(MAX_SPEED, BASE_SPEED + score * SPEED_PER_SCORE);
+            const remaining = (rowRemaining.get(o.rowId) || 1) - 1;
+            if (remaining <= 0) {
+                rowRemaining.delete(o.rowId);
+                score++;
+                speed = Math.min(MAX_SPEED, BASE_SPEED + score * SPEED_PER_SCORE);
+            } else {
+                rowRemaining.set(o.rowId, remaining);
+            }
         }
     }
     obstacles = obstacles.filter(o => o.y < H + 40);

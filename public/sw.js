@@ -1,4 +1,4 @@
-const CACHE = 'onehand-v13';
+const CACHE = 'onehand-v14';
 // HTML is not pre-cached — always fetched fresh from network. Gaze's
 // external CDN dependencies (MediaPipe) are deliberately NOT listed here —
 // pre-caching them at SW install time would fail the whole install if the

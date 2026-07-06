@@ -24,19 +24,31 @@ resize();
 
 const GRAVITY = 1600;          // px/s^2
 const FLAP_VELOCITY = -460;    // px/s (negative = up)
-const PIPE_SPEED = 190;        // px/s
-const PIPE_GAP = 230;          // px
 const PIPE_WIDTH = 74;         // px
-const PIPE_INTERVAL = 1500;    // ms between spawns
 const BIRD_RADIUS = 18;        // px
 const BIRD_X_RATIO = 0.32;     // fraction of screen width
+
+// Difficulty ramps with score: pipes speed up, the gap narrows, and they
+// come more often — all with floors/caps so it never becomes unfair, just
+// steadily harder the longer a run goes.
+const PIPE_SPEED_BASE = 190;   // px/s
+const PIPE_SPEED_MAX = 340;
+const PIPE_SPEED_PER_SCORE = 6;
+
+const PIPE_GAP_BASE = 230;     // px
+const PIPE_GAP_MIN = 165;
+const PIPE_GAP_PER_SCORE = 3;
+
+const PIPE_INTERVAL_BASE = 1500; // ms
+const PIPE_INTERVAL_MIN = 1000;
+const PIPE_INTERVAL_PER_SCORE = 15;
 
 const BEST_KEY = 'onehand-flap-best';
 
 const STATE = { START: 'start', PLAYING: 'playing', OVER: 'over' };
 let state = STATE.START;
 
-let bird, pipes, score, best, spawnTimerMs, lastTime;
+let bird, pipes, score, best, spawnTimerMs, pipeSpeed, lastTime;
 
 function loadBest() {
     return parseInt(localStorage.getItem(BEST_KEY) || '0', 10);
@@ -50,7 +62,16 @@ function reset() {
     pipes = [];
     score = 0;
     spawnTimerMs = 0;
+    pipeSpeed = PIPE_SPEED_BASE;
     state = STATE.START;
+}
+
+function currentGap() {
+    return Math.max(PIPE_GAP_MIN, PIPE_GAP_BASE - score * PIPE_GAP_PER_SCORE);
+}
+
+function currentInterval() {
+    return Math.max(PIPE_INTERVAL_MIN, PIPE_INTERVAL_BASE - score * PIPE_INTERVAL_PER_SCORE);
 }
 
 function flap() {
@@ -65,11 +86,12 @@ function flap() {
 }
 
 function spawnPipe() {
+    const gap = currentGap();
     const margin = 60;
     const minTop = margin;
-    const maxTop = H - margin - PIPE_GAP;
+    const maxTop = H - margin - gap;
     const top = minTop + Math.random() * Math.max(0, maxTop - minTop);
-    pipes.push({ x: W + PIPE_WIDTH, top, scored: false });
+    pipes.push({ x: W + PIPE_WIDTH, top, gap, scored: false });
 }
 
 function gameOver() {
@@ -86,17 +108,18 @@ function update(dt) {
     bird.rot = Math.max(-0.5, Math.min(1.2, bird.vy / 500));
 
     spawnTimerMs += dt * 1000;
-    if (spawnTimerMs >= PIPE_INTERVAL) {
+    if (spawnTimerMs >= currentInterval()) {
         spawnTimerMs = 0;
         spawnPipe();
     }
 
     const birdX = W * BIRD_X_RATIO;
     for (const p of pipes) {
-        p.x -= PIPE_SPEED * dt;
+        p.x -= pipeSpeed * dt;
         if (!p.scored && p.x + PIPE_WIDTH < birdX) {
             p.scored = true;
             score++;
+            pipeSpeed = Math.min(PIPE_SPEED_MAX, PIPE_SPEED_BASE + score * PIPE_SPEED_PER_SCORE);
         }
     }
     pipes = pipes.filter(p => p.x > -PIPE_WIDTH);
@@ -114,7 +137,7 @@ function update(dt) {
     }
     for (const p of pipes) {
         if (birdX + BIRD_RADIUS > p.x && birdX - BIRD_RADIUS < p.x + PIPE_WIDTH) {
-            if (bird.y - BIRD_RADIUS < p.top || bird.y + BIRD_RADIUS > p.top + PIPE_GAP) {
+            if (bird.y - BIRD_RADIUS < p.top || bird.y + BIRD_RADIUS > p.top + p.gap) {
                 gameOver();
                 return;
             }
@@ -131,7 +154,7 @@ function draw() {
     ctx.fillStyle = '#2f7a4d';
     for (const p of pipes) {
         ctx.fillRect(p.x, 0, PIPE_WIDTH, p.top);
-        ctx.fillRect(p.x, p.top + PIPE_GAP, PIPE_WIDTH, H - (p.top + PIPE_GAP));
+        ctx.fillRect(p.x, p.top + p.gap, PIPE_WIDTH, H - (p.top + p.gap));
     }
 
     const birdX = W * BIRD_X_RATIO;
