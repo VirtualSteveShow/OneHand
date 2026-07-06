@@ -239,7 +239,16 @@ const LANE_COUNT = 3;
 const LANE_LERP_RATE = 12;
 
 const GAZE_SMOOTH_RATE = 10;  // per second
-const GAZE_THRESHOLD = 0.10;  // classify left/right beyond this smoothed value
+const GAZE_THRESHOLD = 0.10;  // fallback only, used if somehow uncalibrated
+
+// Per-user calibration: a fixed symmetric threshold assumes your natural
+// left/right gaze range is symmetric around center, which it often isn't
+// (camera angle, individual anatomy, etc.) — a user found "right" was much
+// harder to trigger than "left" with the fixed threshold. Calibrating
+// against this user's own observed left/center/right range fixes that
+// regardless of the underlying cause.
+const AREA_CALIB_FRACTION = 0.4;   // trigger at 40% of the way from center to your calibrated extreme
+const AREA_CALIB_MIN_OFFSET = 0.04; // safety floor in case a calibration sample was too close to center
 
 const AREA_OBSTACLE_HEIGHT = 50;
 const AREA_SPEED_BASE = 220;
@@ -253,6 +262,29 @@ const AREA_SPAWN_JITTER_MS = 150;
 
 let areaPlayer, areaObstacles, areaSpawnTimerMs, areaSpawnIntervalMs, areaSpeed;
 let areaRowRemaining, areaNextRowId;
+
+let areaCalibrating = false;
+let areaCalibIndex = 0;
+let areaCalibSamples = [];
+let areaCalibration = null; // { left, center, right } gazeXSmooth values, or null if never calibrated
+
+const AREA_CALIB_STEPS = ['LOOK LEFT', 'LOOK CENTER', 'LOOK RIGHT'];
+
+function startAreaCalibration() {
+    areaCalibrating = true;
+    areaCalibIndex = 0;
+    areaCalibSamples = [];
+}
+
+function captureAreaCalibSample() {
+    areaCalibSamples.push(gazeXSmooth);
+    areaCalibIndex++;
+    if (areaCalibIndex >= AREA_CALIB_STEPS.length) {
+        areaCalibration = { left: areaCalibSamples[0], center: areaCalibSamples[1], right: areaCalibSamples[2] };
+        areaCalibrating = false;
+        resetAreaRun();
+    }
+}
 
 function areaLaneCenterX(lane) {
     const laneWidth = W / LANE_COUNT;
@@ -280,8 +312,18 @@ function areaGameOver() {
 }
 
 function classifyGazeLane(smoothed) {
-    if (smoothed < -GAZE_THRESHOLD) return 0;
-    if (smoothed > GAZE_THRESHOLD) return 2;
+    if (!areaCalibration) {
+        // Shouldn't normally happen — Area requires calibration before play —
+        // but keep a safe fallback rather than crashing.
+        if (smoothed < -GAZE_THRESHOLD) return 0;
+        if (smoothed > GAZE_THRESHOLD) return 2;
+        return 1;
+    }
+    const { left, center, right } = areaCalibration;
+    const leftThresh = Math.min(center - AREA_CALIB_MIN_OFFSET, center + (left - center) * AREA_CALIB_FRACTION);
+    const rightThresh = Math.max(center + AREA_CALIB_MIN_OFFSET, center + (right - center) * AREA_CALIB_FRACTION);
+    if (smoothed < leftThresh) return 0;
+    if (smoothed > rightThresh) return 2;
     return 1;
 }
 
@@ -391,6 +433,7 @@ function drawArea() {
         ctx.font = '13px monospace';
         ctx.fillText('TAP TO START, THEN LOOK L/C/R', W / 2, H * 0.36 + 28);
         if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawRecalibrateHint();
         drawChangeModeHint();
     }
 
@@ -408,6 +451,17 @@ function drawArea() {
         ctx.font = '14px monospace';
         ctx.fillText('TAP TO RETRY', W / 2, H * 0.3 + 122);
     }
+}
+
+function drawAreaCalibration() {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 26px monospace';
+    ctx.fillText(AREA_CALIB_STEPS[areaCalibIndex], W / 2, H * 0.42);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText('HOLD YOUR GAZE, THEN TAP', W / 2, H * 0.42 + 30);
+    ctx.fillText((areaCalibIndex + 1) + ' / ' + AREA_CALIB_STEPS.length, W / 2, H * 0.42 + 52);
 }
 
 // --- Full mode (continuous gaze-point tracking, calibrated) -----------------
@@ -674,8 +728,10 @@ function enterMode(m) {
     mode = m;
     state = STATE.IN_GAME;
     if (m === 'blink') resetBlinkRun();
-    else if (m === 'area') resetAreaRun();
-    else if (m === 'full') {
+    else if (m === 'area') {
+        if (areaCalibration) resetAreaRun();
+        else startAreaCalibration();
+    } else if (m === 'full') {
         if (fullCalibration) resetFullRun();
         else startFullCalibration();
     }
@@ -843,8 +899,10 @@ function draw() {
         drawModeSelect();
     } else if (state === STATE.IN_GAME) {
         if (mode === 'blink') drawBlink();
-        else if (mode === 'area') drawArea();
-        else if (mode === 'full') {
+        else if (mode === 'area') {
+            if (areaCalibrating) drawAreaCalibration();
+            else drawArea();
+        } else if (mode === 'full') {
             if (fullCalibrating) drawCalibration();
             else drawFull();
         }
@@ -893,12 +951,20 @@ canvas.addEventListener('pointerdown', e => {
     }
 
     if (state === STATE.IN_GAME) {
+        if (mode === 'area' && areaCalibrating) {
+            captureAreaCalibSample();
+            return;
+        }
         if (mode === 'full' && fullCalibrating) {
             captureCalibSample();
             return;
         }
         if (modeState === MODE_STATE.START && pointInRect(x, y, changeModeHintRect())) {
             state = STATE.MODE_SELECT;
+            return;
+        }
+        if (mode === 'area' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
+            startAreaCalibration();
             return;
         }
         if (mode === 'full' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
