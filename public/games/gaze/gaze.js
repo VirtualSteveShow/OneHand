@@ -1101,7 +1101,9 @@ function enterMode(m) {
     // reachable through the normal UI today (mode-switch is only tappable
     // while modeState is already START), but cheap to make foolproof.
     modeState = MODE_STATE.START;
-    if (m === 'area' || m === 'split') {
+    if (m === 'area') {
+        // Landscape is only scoped to Area (confirmed working); Split stays
+        // portrait per user request.
         tryLockLandscape();
     } else {
         try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (err) { /* no-op */ }
@@ -1215,9 +1217,9 @@ async function tryLockLandscape() {
     // that: it forces the page's rendering into landscape regardless of the
     // auto-rotate setting, so the user then physically turns the phone
     // sideways to view it comfortably — which is exactly the physical
-    // rotation this is meant to test. Scoped to Area/Split (the two modes
-    // that actually benefit from the extra width) rather than applied
-    // globally.
+    // rotation this is meant to test. Confirmed working for Area on a real
+    // device; scoped to Area only (Split stays portrait, per user request)
+    // rather than applied globally.
     try {
         if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
             await document.documentElement.requestFullscreen();
