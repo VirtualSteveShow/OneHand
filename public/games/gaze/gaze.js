@@ -64,6 +64,15 @@ let modeState = MODE_STATE.START;
 
 let faceLandmarker = null;
 let cameraStream = null;
+// Face-landmark inference is expensive (WASM/GPU ML, tens of ms even at a
+// 320x240 feed). Running it on every requestAnimationFrame tick — as before
+// — competes with the canvas render loop for the same frame's paint budget,
+// since all rAF callbacks queued for a frame must finish before it paints.
+// Throttling detection to its own setTimeout cadence, decoupled from rAF
+// entirely, lets the render loop stay at a full unthrottled frame rate. 20Hz
+// is still comfortably fast enough to catch a blink's ~100-400ms closure or
+// a coarse look-direction change.
+const DETECT_INTERVAL_MS = 50;
 let blinkSignal = 0;   // raw eyeBlinkLeft/Right average, 0..1
 let wasBlinking = false;
 let gazeXRaw = 0;       // raw look-direction signal, roughly -1 (left) .. 1 (right)
@@ -1274,7 +1283,7 @@ function detectLoop() {
         }
         wasBlinking = isBlinking;
     }
-    requestAnimationFrame(detectLoop);
+    setTimeout(detectLoop, DETECT_INTERVAL_MS);
 }
 
 window.addEventListener('pagehide', () => {
