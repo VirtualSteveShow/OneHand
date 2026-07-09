@@ -1,4 +1,4 @@
-const CACHE = 'onehand-v31';
+const CACHE = 'onehand-v32';
 // HTML is not pre-cached — always fetched fresh from network. Gaze's
 // external CDN dependencies (MediaPipe) are deliberately NOT listed here —
 // pre-caching them at SW install time would fail the whole install if the
@@ -17,6 +17,7 @@ const ASSETS = [
     'games/glide/style.css', 'games/glide/glide.js',
     'games/blow/style.css', 'games/blow/blow.js',
     'games/shake/style.css', 'games/shake/shake.js',
+    'games/scope/style.css', 'games/scope/scope.js',
 ];
 
 self.addEventListener('install', e => {
