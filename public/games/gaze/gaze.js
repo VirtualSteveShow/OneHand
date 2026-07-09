@@ -300,10 +300,12 @@ const DUCK_SPEED_PER_SCORE = 6;
 
 // Deliberately much sparser than Blink's 1500ms pipe interval — the whole
 // point of this mode is that blinking stays an occasional, deliberate act.
-const DUCK_SPAWN_BASE_MS = 2200;
-const DUCK_SPAWN_MIN_MS = 1400;
-const DUCK_SPAWN_PER_SCORE = 25;
-const DUCK_SPAWN_JITTER_MS = 250;
+// Widened further after user feedback that the original 2200/1400ms pacing
+// still felt too frequent.
+const DUCK_SPAWN_BASE_MS = 3400;
+const DUCK_SPAWN_MIN_MS = 2400;
+const DUCK_SPAWN_PER_SCORE = 20;
+const DUCK_SPAWN_JITTER_MS = 300;
 
 let duckObstacles, duckSpawnTimerMs, duckSpawnIntervalMs, duckSpeed, duckCrouchRemainingMs;
 
