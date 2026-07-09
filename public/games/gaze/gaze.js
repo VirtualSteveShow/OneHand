@@ -2,22 +2,45 @@
 
 // One-handed contract: this game's whole premise is different from the rest
 // of the hub — instead of a touch gesture, the input is the front camera
-// reading your face. Three modes share one camera/model session (loaded
-// once, switching modes doesn't reload it):
+// reading your face. Six modes share one camera/model session (loaded once,
+// switching modes doesn't reload it):
 //   - Blink: a blink is a binary trigger, exactly like Flap's tap — the
 //     physics/pipes are Flap's, unmodified, input source swapped.
+//   - Duck: also blink-triggered, but deliberately the opposite pace from
+//     Blink — Flap's gravity demands near-continuous blinking just to stay
+//     airborne, which some players found tiring/unnatural. Duck has no
+//     falling to fight; the runner stands still and a blink only matters in
+//     the brief window a sparse, widely-spaced overhead bar is crossing, so
+//     blinks stay rare and deliberate instead of a rapid-fire rhythm.
 //   - Area: coarse look-direction (left/center/right) reused as Dash's 3
 //     lanes, but with only one obstacle type and never more than 2 lanes
 //     filled at once — there's no jump/duck fallback here, so a lane must
 //     always be free as an escape purely via where you're looking.
+//   - Split: Area without the center lane — a user found juggling 3 zones
+//     less certain than a clean binary left/right choice.
+//   - Dual: Split's look-left/right lanes plus Duck's blink-to-crouch,
+//     combined — most obstacles block a single lane (dodge by looking
+//     away), but every so often a full-width barrier blocks both lanes at
+//     once and can only be passed by blinking to duck under it. Has its own
+//     independent left/right calibration (doesn't share Split's), matching
+//     how every other mode here owns its full state rather than reaching
+//     into a sibling mode's variables.
 //   - Full: continuous gaze-point tracking. A 5-point look-and-tap
 //     calibration fits a small linear regression (hand-rolled least
-//     squares, no external calibration library) mapping the same
-//     look-direction signal Area uses (now on both axes) to actual screen
-//     coordinates. Targets need a sustained (cumulative, not strict) dwell
-//     to score — the most technically ambitious and least accurate mode of
-//     the three, by nature of estimating a 2D point from a phone camera
-//     without dedicated eye-tracking hardware.
+//     squares, no external calibration library) mapping a gaze signal to
+//     actual screen coordinates. Targets need a sustained (cumulative, not
+//     strict) dwell to score. Uses its own iris-landmark-relative gaze
+//     signal (see fullGazeXRaw/fullGazeYRaw below) rather than the
+//     blendshape category scores Area/Split/Dual use for lane
+//     classification — those coarse expression-intensity scores are enough
+//     to tell left/center/right apart but too imprecise for a continuous 2D
+//     point, so Full computes iris position relative to each eye's corners
+//     instead, which is the standard webcam eye-tracking technique and
+//     gives meaningfully finer resolution. Kept as a separate signal path
+//     so this change can't regress the other modes' already-tuned tracking.
+//     Still the most technically ambitious and least accurate mode here, by
+//     nature of estimating a 2D point from a phone camera without dedicated
+//     eye-tracking hardware.
 //
 // Video is processed entirely on-device via WASM (MediaPipe Tasks Vision);
 // nothing is ever recorded, stored, or sent anywhere. Starting/retrying a
@@ -58,7 +81,7 @@ const STATE = { PERMISSION: 'permission', LOADING: 'loading', ERROR: 'error', MO
 let state = STATE.PERMISSION;
 let errorReason = '';
 
-let mode = null; // 'blink' | 'area'
+let mode = null; // 'blink' | 'duck' | 'area' | 'split' | 'dual' | 'full'
 const MODE_STATE = { START: 'start', PLAYING: 'playing', OVER: 'over' };
 let modeState = MODE_STATE.START;
 
@@ -79,6 +102,15 @@ let gazeXRaw = 0;       // raw look-direction signal, roughly -1 (left) .. 1 (ri
 let gazeXSmooth = 0;
 let gazeYRaw = 0;       // roughly -1 (up) .. 1 (down)
 let gazeYSmooth = 0;
+
+// Full mode's own gaze signal — iris position relative to each eye's
+// corners/lids (roughly -0.5..0.5 on each axis), computed separately from
+// gazeXRaw/gazeYRaw above. See the file-level comment for why this is kept
+// isolated from the blendshape-based signal Area/Split/Dual use.
+let fullGazeXRaw = 0;
+let fullGazeXSmooth = 0;
+let fullGazeYRaw = 0;
+let fullGazeYSmooth = 0;
 
 let lastTime;
 
@@ -221,6 +253,164 @@ function drawBlink() {
         ctx.fillStyle = '#888888';
         ctx.font = '13px monospace';
         ctx.fillText('LOOK AT THE SCREEN AND BLINK', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.32);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.32 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.32 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.32 + 122);
+    }
+}
+
+// --- Duck mode (blink-triggered crouch, deliberately sparse timing) --------
+//
+// See the file-level comment for why this exists alongside Blink. There's
+// no gravity here — the runner stays on the ground line, and a blink starts
+// a fixed-length crouch rather than an instantaneous flap, so the timing
+// pressure comes from spacing the bars far apart rather than from a
+// constantly-decaying vertical position.
+
+const DUCK_BEST_KEY = 'onehand-gaze-duck-best';
+
+const DUCK_STAND_H = 54;
+const DUCK_CROUCH_H = 24;
+const DUCK_HITBOX_HALF_W = 20;
+const DUCK_CROUCH_HOLD_MS = 550; // how long a single blink keeps the runner crouched
+const DUCK_X_RATIO = 0.32;
+
+const DUCK_OBSTACLE_WIDTH = 74;
+// Gap between the ground and a bar's bottom edge — smaller than
+// DUCK_STAND_H and bigger than DUCK_CROUCH_H, so standing always hits and
+// crouching always clears; there's no ambiguous middle case to misjudge.
+const DUCK_CLEARANCE = 38;
+const DUCK_SPEED_BASE = 220;
+const DUCK_SPEED_MAX = 380;
+const DUCK_SPEED_PER_SCORE = 6;
+
+// Deliberately much sparser than Blink's 1500ms pipe interval — the whole
+// point of this mode is that blinking stays an occasional, deliberate act.
+const DUCK_SPAWN_BASE_MS = 2200;
+const DUCK_SPAWN_MIN_MS = 1400;
+const DUCK_SPAWN_PER_SCORE = 25;
+const DUCK_SPAWN_JITTER_MS = 250;
+
+let duckObstacles, duckSpawnTimerMs, duckSpawnIntervalMs, duckSpeed, duckCrouchRemainingMs;
+
+function duckBaselineY() { return H * 0.78; }
+
+function resetDuckRun() {
+    duckObstacles = [];
+    score = 0;
+    duckSpawnTimerMs = 0;
+    duckSpawnIntervalMs = DUCK_SPAWN_BASE_MS;
+    duckSpeed = DUCK_SPEED_BASE;
+    duckCrouchRemainingMs = 0;
+    best = loadBestFor(DUCK_BEST_KEY);
+    modeState = MODE_STATE.START;
+}
+
+function duckGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(DUCK_BEST_KEY, best);
+}
+
+function duckTrigger() {
+    if (modeState === MODE_STATE.START) {
+        modeState = MODE_STATE.PLAYING;
+    } else if (modeState === MODE_STATE.PLAYING) {
+        duckCrouchRemainingMs = DUCK_CROUCH_HOLD_MS;
+    }
+}
+
+function spawnDuckObstacle() {
+    duckObstacles.push({ x: W + DUCK_OBSTACLE_WIDTH, scored: false });
+}
+
+function updateDuck(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
+
+    if (duckCrouchRemainingMs > 0) duckCrouchRemainingMs = Math.max(0, duckCrouchRemainingMs - dt * 1000);
+
+    duckSpawnTimerMs += dt * 1000;
+    if (duckSpawnTimerMs >= duckSpawnIntervalMs) {
+        duckSpawnTimerMs = 0;
+        duckSpawnIntervalMs = Math.max(DUCK_SPAWN_MIN_MS, DUCK_SPAWN_BASE_MS - score * DUCK_SPAWN_PER_SCORE)
+            + (Math.random() * DUCK_SPAWN_JITTER_MS * 2 - DUCK_SPAWN_JITTER_MS);
+        spawnDuckObstacle();
+    }
+
+    const playerX = W * DUCK_X_RATIO;
+    const crouching = duckCrouchRemainingMs > 0;
+    const headY = duckBaselineY() - (crouching ? DUCK_CROUCH_H : DUCK_STAND_H);
+    const barBottomY = duckBaselineY() - DUCK_CLEARANCE;
+
+    for (const o of duckObstacles) {
+        o.x -= duckSpeed * dt;
+
+        const overlapsX = playerX + DUCK_HITBOX_HALF_W > o.x && playerX - DUCK_HITBOX_HALF_W < o.x + DUCK_OBSTACLE_WIDTH;
+        if (overlapsX && headY < barBottomY) {
+            duckGameOver();
+            return;
+        }
+
+        if (!o.scored && o.x + DUCK_OBSTACLE_WIDTH < playerX) {
+            o.scored = true;
+            score++;
+            duckSpeed = Math.min(DUCK_SPEED_MAX, DUCK_SPEED_BASE + score * DUCK_SPEED_PER_SCORE);
+        }
+    }
+    duckObstacles = duckObstacles.filter(o => o.x > -DUCK_OBSTACLE_WIDTH);
+}
+
+function drawDuck() {
+    const baseline = duckBaselineY();
+    ctx.strokeStyle = '#242424';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, baseline);
+    ctx.lineTo(W, baseline);
+    ctx.stroke();
+
+    ctx.fillStyle = '#2f7a4d';
+    const barBottomY = baseline - DUCK_CLEARANCE;
+    for (const o of duckObstacles) {
+        ctx.fillRect(o.x, 0, DUCK_OBSTACLE_WIDTH, barBottomY);
+    }
+
+    const crouching = duckCrouchRemainingMs > 0;
+    const h = crouching ? DUCK_CROUCH_H : DUCK_STAND_H;
+    const playerX = W * DUCK_X_RATIO;
+    ctx.fillStyle = crouching ? '#4ec97a' : '#e8d83d';
+    roundRect(playerX - 22, baseline - h, 44, h, 10);
+    ctx.fill();
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('BLINK TO DUCK', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('LOOK AT THE SCREEN AND BLINK UNDER BARS', W / 2, H * 0.36 + 28);
         if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
         drawChangeModeHint();
     }
@@ -687,8 +877,8 @@ function computeCalibration(samples) {
 function applyCalibration() {
     if (!fullCalibration) { fullPredX = W / 2; fullPredY = H / 2; return; }
     const { calibX, calibY } = fullCalibration;
-    const px = calibX[0] * gazeXSmooth + calibX[1] * gazeYSmooth + calibX[2];
-    const py = calibY[0] * gazeXSmooth + calibY[1] * gazeYSmooth + calibY[2];
+    const px = calibX[0] * fullGazeXSmooth + calibX[1] * fullGazeYSmooth + calibX[2];
+    const py = calibY[0] * fullGazeXSmooth + calibY[1] * fullGazeYSmooth + calibY[2];
     fullPredX = Math.max(0, Math.min(W, px));
     fullPredY = Math.max(0, Math.min(H, py));
 }
@@ -702,7 +892,7 @@ function startFullCalibration() {
 function captureCalibSample() {
     const pt = CALIB_POINTS[fullCalibIndex];
     fullCalibSamples.push({
-        gazeX: gazeXSmooth, gazeY: gazeYSmooth,
+        gazeX: fullGazeXSmooth, gazeY: fullGazeYSmooth,
         screenX: pt.fx * W, screenY: pt.fy * H,
     });
     fullCalibIndex++;
@@ -1056,10 +1246,249 @@ function drawSplit() {
     }
 }
 
+// --- Dual mode (Split's lanes + Duck's blink-to-duck, combined) -------------
+//
+// See the file-level comment for the rationale. Deliberately duplicates
+// Split's lane-classification shape and Duck's crouch shape into their own
+// dual-prefixed state rather than reaching into either sibling mode's
+// variables — matches how Area and Split already each own a full,
+// independent copy of near-identical lane logic elsewhere in this file.
+
+const DUAL_BEST_KEY = 'onehand-gaze-dual-best';
+const DUAL_LANE_COUNT = 2;
+
+const DUAL_STAND_H = 54;
+const DUAL_CROUCH_H = 24;
+const DUAL_CROUCH_HOLD_MS = 550;
+
+const DUAL_OBSTACLE_HEIGHT = 50;
+const DUAL_CLEARANCE = 38; // barrier gap — same role as DUCK_CLEARANCE
+
+const DUAL_SPEED_BASE = 220;
+const DUAL_SPEED_MAX = 400;
+const DUAL_SPEED_PER_SCORE = 7;
+
+const DUAL_SPAWN_BASE_MS = 1300;
+const DUAL_SPAWN_MIN_MS = 750;
+const DUAL_SPAWN_PER_SCORE = 18;
+const DUAL_SPAWN_JITTER_MS = 150;
+const DUAL_BARRIER_CHANCE = 0.28; // fraction of spawns that are full-width barriers instead of single-lane obstacles
+
+const DUAL_CALIB_STEPS = [
+    { title: 'LOOK LEFT', fx: 0.06 },
+    { title: 'LOOK RIGHT', fx: 0.94 },
+];
+
+let dualPlayer, dualObstacles, dualSpawnTimerMs, dualSpawnIntervalMs, dualSpeed, dualCrouchRemainingMs;
+let dualCalibrating = false;
+let dualCalibIndex = 0;
+let dualCalibSamples = [];
+let dualCenter = null; // independent from splitCenter — see file-level comment
+
+function dualLaneCenterX(lane) {
+    const laneWidth = W / DUAL_LANE_COUNT;
+    return laneWidth * (lane + 0.5);
+}
+function dualBaselineY() { return H * 0.78; }
+
+function classifyDualLane(smoothed) {
+    if (dualCenter === null) return smoothed < 0 ? 0 : 1;
+    return smoothed < dualCenter ? 0 : 1;
+}
+
+function startDualCalibration() {
+    dualCalibrating = true;
+    dualCalibIndex = 0;
+    dualCalibSamples = [];
+}
+
+function captureDualCalibSample() {
+    dualCalibSamples.push(gazeXSmooth);
+    dualCalibIndex++;
+    if (dualCalibIndex >= DUAL_CALIB_STEPS.length) {
+        const [left, right] = dualCalibSamples;
+        dualCenter = (left + right) / 2;
+        dualCalibrating = false;
+        resetDualRun();
+    }
+}
+
+function resetDualRun() {
+    const initialLane = classifyDualLane(gazeXSmooth);
+    dualPlayer = { lane: initialLane, targetLane: initialLane };
+    dualObstacles = [];
+    score = 0;
+    dualSpawnTimerMs = 0;
+    dualSpawnIntervalMs = DUAL_SPAWN_BASE_MS;
+    dualSpeed = DUAL_SPEED_BASE;
+    dualCrouchRemainingMs = 0;
+    best = loadBestFor(DUAL_BEST_KEY);
+    modeState = MODE_STATE.START;
+}
+
+function dualGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(DUAL_BEST_KEY, best);
+}
+
+function dualDuckTrigger() {
+    if (modeState === MODE_STATE.PLAYING) dualCrouchRemainingMs = DUAL_CROUCH_HOLD_MS;
+}
+
+function spawnDualObstacle() {
+    if (Math.random() < DUAL_BARRIER_CHANCE) {
+        dualObstacles.push({ barrier: true, y: -DUAL_OBSTACLE_HEIGHT, scored: false });
+    } else {
+        const lane = Math.floor(Math.random() * DUAL_LANE_COUNT);
+        dualObstacles.push({ barrier: false, lane, y: -DUAL_OBSTACLE_HEIGHT, scored: false });
+    }
+}
+
+function updateDual(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
+
+    if (dualCrouchRemainingMs > 0) dualCrouchRemainingMs = Math.max(0, dualCrouchRemainingMs - dt * 1000);
+
+    dualPlayer.targetLane = classifyDualLane(gazeXSmooth);
+    dualPlayer.lane += (dualPlayer.targetLane - dualPlayer.lane) * Math.min(1, dt * LANE_LERP_RATE);
+
+    dualSpawnTimerMs += dt * 1000;
+    if (dualSpawnTimerMs >= dualSpawnIntervalMs) {
+        dualSpawnTimerMs = 0;
+        dualSpawnIntervalMs = Math.max(DUAL_SPAWN_MIN_MS, DUAL_SPAWN_BASE_MS - score * DUAL_SPAWN_PER_SCORE)
+            + (Math.random() * DUAL_SPAWN_JITTER_MS * 2 - DUAL_SPAWN_JITTER_MS);
+        spawnDualObstacle();
+    }
+
+    const hitY = dualBaselineY();
+    const crouching = dualCrouchRemainingMs > 0;
+    const playerTopY = hitY - (crouching ? DUAL_CROUCH_H : DUAL_STAND_H);
+    const barrierBottomY = hitY - DUAL_CLEARANCE;
+
+    for (const o of dualObstacles) {
+        o.y += dualSpeed * dt;
+        const spans = o.y <= hitY && hitY <= o.y + DUAL_OBSTACLE_HEIGHT;
+
+        if (o.barrier) {
+            if (spans && playerTopY < barrierBottomY) {
+                dualGameOver();
+                return;
+            }
+        } else if (spans && Math.abs(dualPlayer.lane - o.lane) < 0.5) {
+            dualGameOver();
+            return;
+        }
+
+        if (!o.scored && o.y > hitY) {
+            o.scored = true;
+            score++;
+            dualSpeed = Math.min(DUAL_SPEED_MAX, DUAL_SPEED_BASE + score * DUAL_SPEED_PER_SCORE);
+        }
+    }
+    dualObstacles = dualObstacles.filter(o => o.y < H + 40);
+}
+
+function drawDualCalibration() {
+    const step = DUAL_CALIB_STEPS[dualCalibIndex];
+    const cx = step.fx * W, cy = H * 0.4;
+
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 24, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(step.title, W / 2, H * 0.72);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText('LOOK AT THE DOT, THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+    ctx.fillText((dualCalibIndex + 1) + ' / ' + DUAL_CALIB_STEPS.length, W / 2, H * 0.72 + 48);
+}
+
+function drawDual() {
+    if (modeState !== MODE_STATE.START) {
+        const laneWidth = W / DUAL_LANE_COUNT;
+        ctx.strokeStyle = '#242424';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(laneWidth, 0);
+        ctx.lineTo(laneWidth, H);
+        ctx.stroke();
+
+        for (const o of dualObstacles) {
+            if (o.barrier) {
+                roundRect(0, o.y, W, DUAL_OBSTACLE_HEIGHT, 8);
+                ctx.fillStyle = '#e83d9a';
+                ctx.fill();
+            } else {
+                const w = laneWidth * 0.7;
+                const x = dualLaneCenterX(o.lane) - w / 2;
+                roundRect(x, o.y, w, DUAL_OBSTACLE_HEIGHT, 8);
+                ctx.fillStyle = '#e8763d';
+                ctx.fill();
+            }
+        }
+
+        const crouching = dualCrouchRemainingMs > 0;
+        const h = crouching ? DUAL_CROUCH_H : DUAL_STAND_H;
+        const px = dualLaneCenterX(dualPlayer ? dualPlayer.lane : 0);
+        const py = dualBaselineY();
+        ctx.fillStyle = crouching ? '#4ec97a' : '#e8d83d';
+        roundRect(px - 23, py - h, 46, h, 12);
+        ctx.fill();
+    }
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('LOOK + BLINK', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('LOOK L/R, BLINK UNDER BARRIERS', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawRecalibrateHint();
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.3);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.3 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.3 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.3 + 122);
+    }
+}
+
 // --- mode select --------------------------------------------------------
 
 function modeButtonRect(index) {
-    return { cx: W / 2, cy: H * 0.26 + index * 68, w: 240, h: 58 };
+    // Tighter spacing than the original 4-mode layout (0.26H start, 68px
+    // gap, 58px tall) — needed to fit 6 buttons on a phone-height viewport
+    // without the last one running off-screen.
+    return { cx: W / 2, cy: H * 0.20 + index * 54, w: 236, h: 46 };
 }
 // Hints are stacked with fixed pixel spacing below each mode's own title
 // line (not a raw fraction of H) — mode-specific because how many hints
@@ -1074,11 +1503,11 @@ function hintStackY(index) {
     return modeTitleBaseY() + 90 + index * 32;
 }
 function changeModeHintRect() {
-    const index = mode === 'area' ? 2 : (mode === 'split' || mode === 'full' ? 1 : 0);
+    const index = mode === 'area' ? 2 : (mode === 'split' || mode === 'full' || mode === 'dual' ? 1 : 0);
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 40 };
 }
 function recalibrateHintRect() {
-    const index = mode === 'area' ? 1 : 0; // split and full both sit at index 0 (just RECALIBRATE + CHANGE MODE)
+    const index = mode === 'area' ? 1 : 0; // split/full/dual all sit at index 0 (just RECALIBRATE + CHANGE MODE)
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 36 };
 }
 function pointInRect(x, y, r) {
@@ -1118,12 +1547,16 @@ function enterMode(m) {
         try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (err) { /* no-op */ }
     }
     if (m === 'blink') resetBlinkRun();
+    else if (m === 'duck') resetDuckRun();
     else if (m === 'area') {
         if (areaCalibration) resetAreaRun();
         else startAreaCalibration();
     } else if (m === 'split') {
         if (splitCenter !== null) resetSplitRun();
         else startSplitCalibration();
+    } else if (m === 'dual') {
+        if (dualCenter !== null) resetDualRun();
+        else startDualCalibration();
     } else if (m === 'full') {
         if (fullCalibration) resetFullRun();
         else startFullCalibration();
@@ -1137,8 +1570,10 @@ function drawModeSelect() {
 
     const labels = [
         ['BLINK', 'Blink to flap'],
+        ['DUCK', 'Blink under bars'],
         ['AREA', 'Look left/center/right'],
         ['SPLIT', 'Look left/right only'],
+        ['DUAL', 'Look L/R, blink to duck'],
         ['FULL', 'Look & dwell (calibrated)'],
     ];
     labels.forEach(([name, sub], i) => {
@@ -1255,6 +1690,39 @@ function blendshapeScore(cats, name) {
     return c ? c.score : 0;
 }
 
+// Standard MediaPipe face-mesh landmark indices for the iris and eye
+// corners/lids (the model behind MODEL_URL outputs the full 478-point mesh,
+// landmarks 468-477 being the iris points added on top of the base 468).
+const IRIS_RIGHT_CENTER = 468, IRIS_LEFT_CENTER = 473;
+const EYE_RIGHT_OUTER = 33, EYE_RIGHT_INNER = 133;
+const EYE_LEFT_INNER = 362, EYE_LEFT_OUTER = 263;
+const EYE_RIGHT_UPPER = 159, EYE_RIGHT_LOWER = 145;
+const EYE_LEFT_UPPER = 386, EYE_LEFT_LOWER = 374;
+
+// Full mode's gaze signal: iris center position normalized against each
+// eye's own corner/lid landmarks (roughly 0 at one edge, 1 at the other),
+// averaged across both eyes and re-centered on 0. This is the standard
+// webcam eye-tracking technique — far more continuous/precise than the
+// blendshape category scores below, which are coarse expression-intensity
+// classifications good enough for 3-way lane detection but not for a
+// continuous 2D point.
+function computeIrisGaze(lm) {
+    const rOuter = lm[EYE_RIGHT_OUTER], rInner = lm[EYE_RIGHT_INNER], rIris = lm[IRIS_RIGHT_CENTER];
+    const lInner = lm[EYE_LEFT_INNER], lOuter = lm[EYE_LEFT_OUTER], lIris = lm[IRIS_LEFT_CENTER];
+    const rUpper = lm[EYE_RIGHT_UPPER], rLower = lm[EYE_RIGHT_LOWER];
+    const lUpper = lm[EYE_LEFT_UPPER], lLower = lm[EYE_LEFT_LOWER];
+
+    const rHoriz = (rIris.x - rOuter.x) / ((rInner.x - rOuter.x) || 1e-6);
+    const lHoriz = (lIris.x - lInner.x) / ((lOuter.x - lInner.x) || 1e-6);
+    const x = ((rHoriz + lHoriz) / 2) - 0.5;
+
+    const rVert = (rIris.y - rUpper.y) / ((rLower.y - rUpper.y) || 1e-6);
+    const lVert = (lIris.y - lUpper.y) / ((lLower.y - lUpper.y) || 1e-6);
+    const y = ((rVert + lVert) / 2) - 0.5;
+
+    return { x, y };
+}
+
 function detectLoop() {
     if (faceLandmarker && videoEl.readyState >= 2) {
         const result = faceLandmarker.detectForVideo(videoEl, performance.now());
@@ -1277,9 +1745,25 @@ function detectLoop() {
             gazeYRaw = 0;
         }
 
+        // Guarded separately from the blendshape branch above: falls back to
+        // the coarser blendshape signal if iris landmarks are ever
+        // unavailable, rather than snapping Full's prediction to a jarring
+        // default.
+        const lm = result.faceLandmarks && result.faceLandmarks[0];
+        if (lm && lm.length > IRIS_LEFT_CENTER) {
+            const iris = computeIrisGaze(lm);
+            fullGazeXRaw = iris.x;
+            fullGazeYRaw = iris.y;
+        } else {
+            fullGazeXRaw = gazeXRaw;
+            fullGazeYRaw = gazeYRaw;
+        }
+
         const isBlinking = blinkSignal > BLINK_THRESHOLD;
-        if (mode === 'blink' && state === STATE.IN_GAME && isBlinking && !wasBlinking) {
-            blinkTrigger();
+        if (state === STATE.IN_GAME && isBlinking && !wasBlinking) {
+            if (mode === 'blink') blinkTrigger();
+            else if (mode === 'duck') duckTrigger();
+            else if (mode === 'dual') dualDuckTrigger();
         }
         wasBlinking = isBlinking;
     }
@@ -1295,12 +1779,16 @@ window.addEventListener('pagehide', () => {
 function update(dt) {
     gazeXSmooth += (gazeXRaw - gazeXSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
     gazeYSmooth += (gazeYRaw - gazeYSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
+    fullGazeXSmooth += (fullGazeXRaw - fullGazeXSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
+    fullGazeYSmooth += (fullGazeYRaw - fullGazeYSmooth) * Math.min(1, dt * GAZE_SMOOTH_RATE);
     if (mode === 'full' && fullCalibration) applyCalibration();
 
     if (state !== STATE.IN_GAME) return;
     if (mode === 'blink') updateBlink(dt);
+    else if (mode === 'duck') updateDuck(dt);
     else if (mode === 'area') updateArea(dt);
     else if (mode === 'split') updateSplit(dt);
+    else if (mode === 'dual') updateDual(dt);
     else if (mode === 'full') updateFull(dt);
 }
 
@@ -1342,6 +1830,7 @@ function draw() {
         drawModeSelect();
     } else if (state === STATE.IN_GAME) {
         if (mode === 'blink') drawBlink();
+        else if (mode === 'duck') drawDuck();
         else if (mode === 'area') {
             if (areaCalibrating) drawAreaCalibration();
             else if (areaAdjusting) drawAreaSensitivity();
@@ -1349,6 +1838,9 @@ function draw() {
         } else if (mode === 'split') {
             if (splitCalibrating) drawSplitCalibration();
             else drawSplit();
+        } else if (mode === 'dual') {
+            if (dualCalibrating) drawDualCalibration();
+            else drawDual();
         } else if (mode === 'full') {
             if (fullCalibrating) drawCalibration();
             else drawFull();
@@ -1392,9 +1884,11 @@ canvas.addEventListener('pointerdown', e => {
 
     if (state === STATE.MODE_SELECT) {
         if (pointInRect(x, y, modeButtonRect(0))) enterMode('blink');
-        else if (pointInRect(x, y, modeButtonRect(1))) enterMode('area');
-        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('split');
-        else if (pointInRect(x, y, modeButtonRect(3))) enterMode('full');
+        else if (pointInRect(x, y, modeButtonRect(1))) enterMode('duck');
+        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('area');
+        else if (pointInRect(x, y, modeButtonRect(3))) enterMode('split');
+        else if (pointInRect(x, y, modeButtonRect(4))) enterMode('dual');
+        else if (pointInRect(x, y, modeButtonRect(5))) enterMode('full');
         return;
     }
 
@@ -1405,6 +1899,10 @@ canvas.addEventListener('pointerdown', e => {
         }
         if (mode === 'split' && splitCalibrating) {
             captureSplitCalibSample();
+            return;
+        }
+        if (mode === 'dual' && dualCalibrating) {
+            captureDualCalibSample();
             return;
         }
         if (mode === 'area' && areaAdjusting) {
@@ -1438,6 +1936,10 @@ canvas.addEventListener('pointerdown', e => {
             startSplitCalibration();
             return;
         }
+        if (mode === 'dual' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
+            startDualCalibration();
+            return;
+        }
         if (mode === 'full' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
             startFullCalibration();
             return;
@@ -1445,12 +1947,18 @@ canvas.addEventListener('pointerdown', e => {
         if (mode === 'blink') {
             if (modeState === MODE_STATE.OVER) resetBlinkRun();
             // modeState START -> PLAYING happens via blink itself, not tap
+        } else if (mode === 'duck') {
+            if (modeState === MODE_STATE.OVER) resetDuckRun();
+            // modeState START -> PLAYING happens via blink itself, not tap
         } else if (mode === 'area') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetAreaRun();
         } else if (mode === 'split') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetSplitRun();
+        } else if (mode === 'dual') {
+            if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
+            else if (modeState === MODE_STATE.OVER) resetDualRun();
         } else if (mode === 'full') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetFullRun();

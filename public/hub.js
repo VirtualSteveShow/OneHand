@@ -1,6 +1,6 @@
 'use strict';
 
-const VERSION = 'v24';
+const VERSION = 'v25';
 
 // Each game gets one entry here once it's built — `id` must match its folder name under
 // public/games/. `tagline` should name the one gesture the game uses (tap/swipe/hold), since
