@@ -286,7 +286,7 @@ const DUCK_BEST_KEY = 'onehand-gaze-duck-best';
 const DUCK_STAND_H = 54;
 const DUCK_CROUCH_H = 24;
 const DUCK_HITBOX_HALF_W = 20;
-const DUCK_CROUCH_HOLD_MS = 550; // how long a single blink keeps the runner crouched
+const DUCK_CROUCH_HOLD_MS = 1000; // how long a single blink keeps the runner crouched
 const DUCK_X_RATIO = 0.32;
 
 const DUCK_OBSTACLE_WIDTH = 74;
@@ -1261,7 +1261,7 @@ const DUAL_LANE_COUNT = 2;
 
 const DUAL_STAND_H = 54;
 const DUAL_CROUCH_H = 24;
-const DUAL_CROUCH_HOLD_MS = 550;
+const DUAL_CROUCH_HOLD_MS = 1000;
 
 const DUAL_OBSTACLE_HEIGHT = 50;
 const DUAL_CLEARANCE = 38; // barrier gap — same role as DUCK_CLEARANCE
