@@ -2,8 +2,8 @@
 
 // One-handed contract: this game's whole premise is different from the rest
 // of the hub — instead of a touch gesture, the input is the front camera
-// reading your face. Six modes share one camera/model session (loaded once,
-// switching modes doesn't reload it):
+// reading your face. Seven modes share one camera/model session (loaded
+// once, switching modes doesn't reload it):
 //   - Blink: a blink is a binary trigger, exactly like Flap's tap — the
 //     physics/pipes are Flap's, unmodified, input source swapped.
 //   - Duck: also blink-triggered, but deliberately the opposite pace from
@@ -11,7 +11,17 @@
 //     airborne, which some players found tiring/unnatural. Duck has no
 //     falling to fight; the runner stands still and a blink only matters in
 //     the brief window a sparse, widely-spaced overhead bar is crossing, so
-//     blinks stay rare and deliberate instead of a rapid-fire rhythm.
+//     blinks stay rare and deliberate instead of a rapid-fire rhythm. A
+//     blink starts a fixed-length timed crouch (DUCK_CROUCH_HOLD_MS).
+//   - Dip: Duck's same obstacles and pacing, but crouching is tied
+//     continuously to gaze position instead of a blink-triggered timer —
+//     look down past a calibrated middle/bottom threshold and the runner
+//     crouches for as long as that gaze holds; look back up and it stands.
+//     Calibration is the same look-a-point-and-tap shape as Split/Dual, just
+//     on the vertical axis (a "look straight ahead" sample and a "look at
+//     the bottom of the phone" sample, midpoint as the threshold), reusing
+//     the gazeYSmooth signal that was otherwise only feeding Full's old
+//     (now replaced) gaze computation.
 //   - Area: coarse look-direction (left/center/right) reused as Dash's 3
 //     lanes, but with only one obstacle type and never more than 2 lanes
 //     filled at once — there's no jump/duck fallback here, so a lane must
@@ -81,7 +91,7 @@ const STATE = { PERMISSION: 'permission', LOADING: 'loading', ERROR: 'error', MO
 let state = STATE.PERMISSION;
 let errorReason = '';
 
-let mode = null; // 'blink' | 'duck' | 'area' | 'split' | 'dual' | 'full'
+let mode = null; // 'blink' | 'duck' | 'dip' | 'area' | 'split' | 'dual' | 'full'
 const MODE_STATE = { START: 'start', PLAYING: 'playing', OVER: 'over' };
 let modeState = MODE_STATE.START;
 
@@ -414,6 +424,206 @@ function drawDuck() {
         ctx.font = '13px monospace';
         ctx.fillText('LOOK AT THE SCREEN AND BLINK UNDER BARS', W / 2, H * 0.36 + 28);
         if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawChangeModeHint();
+    }
+
+    if (modeState === MODE_STATE.OVER) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 26px monospace';
+        ctx.fillText('GAME OVER', W / 2, H * 0.32);
+        ctx.fillStyle = '#e8d83d';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, H * 0.32 + 58);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('BEST ' + best, W / 2, H * 0.32 + 84);
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = '14px monospace';
+        ctx.fillText('TAP TO RETRY', W / 2, H * 0.32 + 122);
+    }
+}
+
+// --- Dip mode (look-down-triggered crouch, continuous not edge-triggered) --
+//
+// See the file-level comment. Same obstacles/pacing/scoring shape as Duck —
+// only the crouch trigger differs: instead of a blink starting a fixed-
+// length timer, crouching is just classifyDip(gazeYSmooth) evaluated fresh
+// every frame, so it tracks gaze position directly rather than firing off a
+// timed action.
+
+const DIP_BEST_KEY = 'onehand-gaze-dip-best';
+
+const DIP_STAND_H = 54;
+const DIP_CROUCH_H = 24;
+const DIP_HITBOX_HALF_W = 20;
+const DIP_X_RATIO = 0.32;
+
+const DIP_OBSTACLE_WIDTH = 74;
+const DIP_CLEARANCE = 38;
+const DIP_SPEED_BASE = 220;
+const DIP_SPEED_MAX = 380;
+const DIP_SPEED_PER_SCORE = 6;
+
+const DIP_SPAWN_BASE_MS = 3400;
+const DIP_SPAWN_MIN_MS = 2400;
+const DIP_SPAWN_PER_SCORE = 20;
+const DIP_SPAWN_JITTER_MS = 300;
+
+// "Middle-bottom" calibration: a straight-ahead sample and a look-at-the-
+// bottom-of-the-phone sample, midpoint becomes the stand/crouch threshold —
+// same shape as Split's LOOK LEFT/RIGHT midpoint, just on the vertical axis.
+const DIP_CALIB_STEPS = [
+    { title: 'LOOK STRAIGHT AHEAD', fx: 0.5, fy: 0.5 },
+    { title: 'LOOK AT THE BOTTOM', fx: 0.5, fy: 0.9 },
+];
+
+let dipObstacles, dipSpawnTimerMs, dipSpawnIntervalMs, dipSpeed;
+let dipCalibrating = false;
+let dipCalibIndex = 0;
+let dipCalibSamples = [];
+let dipCenter = null; // midpoint of the calibrated center/down gazeYSmooth values
+
+function dipBaselineY() { return H * 0.78; }
+
+function classifyDip(smoothed) {
+    if (dipCenter === null) return false; // shouldn't normally happen — Dip requires calibration before play
+    return smoothed > dipCenter;
+}
+
+function startDipCalibration() {
+    dipCalibrating = true;
+    dipCalibIndex = 0;
+    dipCalibSamples = [];
+}
+
+function captureDipCalibSample() {
+    dipCalibSamples.push(gazeYSmooth);
+    dipCalibIndex++;
+    if (dipCalibIndex >= DIP_CALIB_STEPS.length) {
+        const [center, down] = dipCalibSamples;
+        dipCenter = (center + down) / 2;
+        dipCalibrating = false;
+        resetDipRun();
+    }
+}
+
+function resetDipRun() {
+    dipObstacles = [];
+    score = 0;
+    dipSpawnTimerMs = 0;
+    dipSpawnIntervalMs = DIP_SPAWN_BASE_MS;
+    dipSpeed = DIP_SPEED_BASE;
+    best = loadBestFor(DIP_BEST_KEY);
+    modeState = MODE_STATE.START;
+}
+
+function dipGameOver() {
+    modeState = MODE_STATE.OVER;
+    best = Math.max(best, score);
+    saveBestFor(DIP_BEST_KEY, best);
+}
+
+function spawnDipObstacle() {
+    dipObstacles.push({ x: W + DIP_OBSTACLE_WIDTH, scored: false });
+}
+
+function updateDip(dt) {
+    if (modeState !== MODE_STATE.PLAYING) return;
+
+    dipSpawnTimerMs += dt * 1000;
+    if (dipSpawnTimerMs >= dipSpawnIntervalMs) {
+        dipSpawnTimerMs = 0;
+        dipSpawnIntervalMs = Math.max(DIP_SPAWN_MIN_MS, DIP_SPAWN_BASE_MS - score * DIP_SPAWN_PER_SCORE)
+            + (Math.random() * DIP_SPAWN_JITTER_MS * 2 - DIP_SPAWN_JITTER_MS);
+        spawnDipObstacle();
+    }
+
+    const playerX = W * DIP_X_RATIO;
+    const crouching = classifyDip(gazeYSmooth);
+    const headY = dipBaselineY() - (crouching ? DIP_CROUCH_H : DIP_STAND_H);
+    const barBottomY = dipBaselineY() - DIP_CLEARANCE;
+
+    for (const o of dipObstacles) {
+        o.x -= dipSpeed * dt;
+
+        const overlapsX = playerX + DIP_HITBOX_HALF_W > o.x && playerX - DIP_HITBOX_HALF_W < o.x + DIP_OBSTACLE_WIDTH;
+        if (overlapsX && headY < barBottomY) {
+            dipGameOver();
+            return;
+        }
+
+        if (!o.scored && o.x + DIP_OBSTACLE_WIDTH < playerX) {
+            o.scored = true;
+            score++;
+            dipSpeed = Math.min(DIP_SPEED_MAX, DIP_SPEED_BASE + score * DIP_SPEED_PER_SCORE);
+        }
+    }
+    dipObstacles = dipObstacles.filter(o => o.x > -DIP_OBSTACLE_WIDTH);
+}
+
+function drawDipCalibration() {
+    const step = DIP_CALIB_STEPS[dipCalibIndex];
+    const cx = step.fx * W, cy = step.fy * H;
+
+    ctx.fillStyle = '#e8d83d';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 24, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eeeeee';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(step.title, W / 2, H * 0.72);
+    ctx.fillStyle = '#888888';
+    ctx.font = '13px monospace';
+    ctx.fillText('LOOK AT THE DOT, THEN TAP ANYWHERE', W / 2, H * 0.72 + 26);
+    ctx.fillText((dipCalibIndex + 1) + ' / ' + DIP_CALIB_STEPS.length, W / 2, H * 0.72 + 48);
+}
+
+function drawDip() {
+    const baseline = dipBaselineY();
+    ctx.strokeStyle = '#242424';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, baseline);
+    ctx.lineTo(W, baseline);
+    ctx.stroke();
+
+    ctx.fillStyle = '#2f7a4d';
+    const barBottomY = baseline - DIP_CLEARANCE;
+    for (const o of dipObstacles) {
+        ctx.fillRect(o.x, 0, DIP_OBSTACLE_WIDTH, barBottomY);
+    }
+
+    const crouching = classifyDip(gazeYSmooth);
+    const h = crouching ? DIP_CROUCH_H : DIP_STAND_H;
+    const playerX = W * DIP_X_RATIO;
+    ctx.fillStyle = crouching ? '#4ec97a' : '#e8d83d';
+    roundRect(playerX - 22, baseline - h, 44, h, 10);
+    ctx.fill();
+
+    ctx.textAlign = 'center';
+
+    if (modeState === MODE_STATE.PLAYING) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText(String(score), W / 2, 80);
+    }
+
+    if (modeState === MODE_STATE.START) {
+        ctx.fillStyle = '#eeeeee';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('LOOK DOWN TO DUCK', W / 2, H * 0.36);
+        ctx.fillStyle = '#888888';
+        ctx.font = '13px monospace';
+        ctx.fillText('TAP TO START, THEN LOOK DOWN UNDER BARS', W / 2, H * 0.36 + 28);
+        if (best > 0) ctx.fillText('BEST ' + best, W / 2, H * 0.36 + 50);
+        drawRecalibrateHint();
         drawChangeModeHint();
     }
 
@@ -1488,9 +1698,9 @@ function drawDual() {
 
 function modeButtonRect(index) {
     // Tighter spacing than the original 4-mode layout (0.26H start, 68px
-    // gap, 58px tall) — needed to fit 6 buttons on a phone-height viewport
+    // gap, 58px tall) — needed to fit 7 buttons on a phone-height viewport
     // without the last one running off-screen.
-    return { cx: W / 2, cy: H * 0.20 + index * 54, w: 236, h: 46 };
+    return { cx: W / 2, cy: H * 0.19 + index * 50, w: 236, h: 44 };
 }
 // Hints are stacked with fixed pixel spacing below each mode's own title
 // line (not a raw fraction of H) — mode-specific because how many hints
@@ -1505,11 +1715,11 @@ function hintStackY(index) {
     return modeTitleBaseY() + 90 + index * 32;
 }
 function changeModeHintRect() {
-    const index = mode === 'area' ? 2 : (mode === 'split' || mode === 'full' || mode === 'dual' ? 1 : 0);
+    const index = mode === 'area' ? 2 : (mode === 'split' || mode === 'full' || mode === 'dual' || mode === 'dip' ? 1 : 0);
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 40 };
 }
 function recalibrateHintRect() {
-    const index = mode === 'area' ? 1 : 0; // split/full/dual all sit at index 0 (just RECALIBRATE + CHANGE MODE)
+    const index = mode === 'area' ? 1 : 0; // split/full/dual/dip all sit at index 0 (just RECALIBRATE + CHANGE MODE)
     return { cx: W / 2, cy: hintStackY(index), w: 220, h: 36 };
 }
 function pointInRect(x, y, r) {
@@ -1550,7 +1760,10 @@ function enterMode(m) {
     }
     if (m === 'blink') resetBlinkRun();
     else if (m === 'duck') resetDuckRun();
-    else if (m === 'area') {
+    else if (m === 'dip') {
+        if (dipCenter !== null) resetDipRun();
+        else startDipCalibration();
+    } else if (m === 'area') {
         if (areaCalibration) resetAreaRun();
         else startAreaCalibration();
     } else if (m === 'split') {
@@ -1573,6 +1786,7 @@ function drawModeSelect() {
     const labels = [
         ['BLINK', 'Blink to flap'],
         ['DUCK', 'Blink under bars'],
+        ['DIP', 'Look down to duck'],
         ['AREA', 'Look left/center/right'],
         ['SPLIT', 'Look left/right only'],
         ['DUAL', 'Look L/R, blink to duck'],
@@ -1788,6 +2002,7 @@ function update(dt) {
     if (state !== STATE.IN_GAME) return;
     if (mode === 'blink') updateBlink(dt);
     else if (mode === 'duck') updateDuck(dt);
+    else if (mode === 'dip') updateDip(dt);
     else if (mode === 'area') updateArea(dt);
     else if (mode === 'split') updateSplit(dt);
     else if (mode === 'dual') updateDual(dt);
@@ -1833,7 +2048,10 @@ function draw() {
     } else if (state === STATE.IN_GAME) {
         if (mode === 'blink') drawBlink();
         else if (mode === 'duck') drawDuck();
-        else if (mode === 'area') {
+        else if (mode === 'dip') {
+            if (dipCalibrating) drawDipCalibration();
+            else drawDip();
+        } else if (mode === 'area') {
             if (areaCalibrating) drawAreaCalibration();
             else if (areaAdjusting) drawAreaSensitivity();
             else drawArea();
@@ -1887,10 +2105,11 @@ canvas.addEventListener('pointerdown', e => {
     if (state === STATE.MODE_SELECT) {
         if (pointInRect(x, y, modeButtonRect(0))) enterMode('blink');
         else if (pointInRect(x, y, modeButtonRect(1))) enterMode('duck');
-        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('area');
-        else if (pointInRect(x, y, modeButtonRect(3))) enterMode('split');
-        else if (pointInRect(x, y, modeButtonRect(4))) enterMode('dual');
-        else if (pointInRect(x, y, modeButtonRect(5))) enterMode('full');
+        else if (pointInRect(x, y, modeButtonRect(2))) enterMode('dip');
+        else if (pointInRect(x, y, modeButtonRect(3))) enterMode('area');
+        else if (pointInRect(x, y, modeButtonRect(4))) enterMode('split');
+        else if (pointInRect(x, y, modeButtonRect(5))) enterMode('dual');
+        else if (pointInRect(x, y, modeButtonRect(6))) enterMode('full');
         return;
     }
 
@@ -1905,6 +2124,10 @@ canvas.addEventListener('pointerdown', e => {
         }
         if (mode === 'dual' && dualCalibrating) {
             captureDualCalibSample();
+            return;
+        }
+        if (mode === 'dip' && dipCalibrating) {
+            captureDipCalibSample();
             return;
         }
         if (mode === 'area' && areaAdjusting) {
@@ -1942,6 +2165,10 @@ canvas.addEventListener('pointerdown', e => {
             startDualCalibration();
             return;
         }
+        if (mode === 'dip' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
+            startDipCalibration();
+            return;
+        }
         if (mode === 'full' && modeState === MODE_STATE.START && pointInRect(x, y, recalibrateHintRect())) {
             startFullCalibration();
             return;
@@ -1961,6 +2188,9 @@ canvas.addEventListener('pointerdown', e => {
         } else if (mode === 'dual') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetDualRun();
+        } else if (mode === 'dip') {
+            if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
+            else if (modeState === MODE_STATE.OVER) resetDipRun();
         } else if (mode === 'full') {
             if (modeState === MODE_STATE.START) modeState = MODE_STATE.PLAYING;
             else if (modeState === MODE_STATE.OVER) resetFullRun();
